@@ -150,10 +150,22 @@ function isBlobstoreUriRegression(error){
   return /Unsupported file uri:\s*blobstore:\/\//i.test(String(error?.message||error||''));
 }
 
+function isTransientVideoError(error){
+  const message=String(error?.message||error||'');
+  return isBlobstoreUriRegression(error)||/high demand|spikes in demand|try again later|temporar(?:y|ily)|overload|service unavailable|unavailable|resource[_ ]exhausted|rate limit|too many requests|deadline|timeout|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b/i.test(message);
+}
+
 async function analyzeDirect({uri,mimeType,youtubeUrl,model,onProgress=()=>{}}){
-  onProgress('Gemini reportó un fallo interno de URI; activando ruta alternativa AGENTIC…',.62);
+  onProgress('Activando ruta AGENTIC con reintentos y cambio automático de modelo…',.62);
   const payload=youtubeUrl?{youtubeUrl,model}:{uri,mimeType,model};
-  const result=await cloudJSON('/video/direct',payload,{retries:1});
+  const result=await cloudJSON('/video/direct',payload,{retries:0});
+  const used=String(result?.modelUsed||model||'Gemini');
+  const fallbacks=Array.isArray(result?.fallbackTrace)?result.fallbackTrace:[];
+  if(fallbacks.length){
+    onProgress(`Gemini respondió con ${used} después de ${fallbacks.length} intento(s) alternativos.`,.95);
+  }else{
+    onProgress(`Gemini respondió con ${used}.`,.95);
+  }
   return normalizeTranscript(result?.transcript||result);
 }
 
@@ -200,7 +212,7 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
         return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
       }catch(error){
         clearActive(active.jobId);
-        if(!isBlobstoreUriRegression(error))throw error;
+        if(!isTransientVideoError(error))throw error;
         const transcript=await analyzeDirect({youtubeUrl:url,model,onProgress});
         return {jobId:null,name:active.name||name,fingerprint,transcript};
       }
@@ -215,7 +227,7 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
       return {jobId:interaction.id,name,fingerprint,transcript};
     }catch(error){
       clearActive(interaction.id);
-      if(!isBlobstoreUriRegression(error))throw error;
+      if(!isTransientVideoError(error))throw error;
       const transcript=await analyzeDirect({youtubeUrl:url,model,onProgress});
       return {jobId:null,name,fingerprint,transcript};
     }
@@ -245,7 +257,7 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
       return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
     }catch(error){
       clearActive(active.jobId);
-      if(!isBlobstoreUriRegression(error))throw error;
+      if(!isTransientVideoError(error))throw error;
       if(active.uri){
         const transcript=await analyzeDirect({uri:active.uri,mimeType:active.mimeType||mimeType,model,onProgress});
         return {jobId:null,name:active.name||name,fingerprint,transcript};
@@ -272,7 +284,7 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
     return {jobId:interaction.id,name,fingerprint,transcript};
   }catch(error){
     clearActive(interaction.id);
-    if(!isBlobstoreUriRegression(error))throw error;
+    if(!isTransientVideoError(error))throw error;
     const transcript=await analyzeDirect({uri,mimeType,model,onProgress});
     return {jobId:null,name,fingerprint,transcript};
   }
