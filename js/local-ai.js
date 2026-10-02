@@ -71,14 +71,9 @@ export async function regenerateSection({model,guides,source,analysis,answers,do
 
 export async function auditLocal({model,guides,source,analysis,document}){
   const ctx=await context([guides[analysis.selected_guide_index]],source,model);
-  const prompt=`Audita el documento completo contra la guía principal y contra los hechos del origen. No evalúes estilo solamente: verifica requisitos, contradicciones, campos sin sustento, omisiones y consistencia. No declares cobertura total de un video salvo que el registro de origen indique coverage.complete=true. Devuelve exclusivamente JSON {"validation":[{"section_title":"","criterion":"","status":"parcial","note":""}],"warnings":[],"editorial_summary":""}. status solo: cumple, parcial o no_aplica.\n\nANÁLISIS INICIAL:\n${JSON.stringify(analysis)}\n\nDOCUMENTO:\n${JSON.stringify(document)}\n\nGUÍA:\n${ctx.guides[0].text}\n\nORIGEN:\n${ctx.source}`;
+  const prompt=`Audita el documento completo contra la guía principal y contra los hechos del origen. No evalúes estilo solamente: verifica requisitos, contradicciones, campos sin sustento, omisiones y consistencia. Si el origen es video, las acciones ACC deben conservar su referencia temporal y, cuando corresponda, el minuto/segundo de captura manual sugerida; no esperes ni exijas imágenes incrustadas. No declares cobertura total de un video salvo que el registro de origen indique coverage.complete=true. Devuelve exclusivamente JSON {"validation":[{"section_title":"","criterion":"","status":"parcial","note":""}],"warnings":[],"editorial_summary":""}. status solo: cumple, parcial o no_aplica.\n\nANÁLISIS INICIAL:\n${JSON.stringify(analysis)}\n\nDOCUMENTO:\n${JSON.stringify(document)}\n\nGUÍA:\n${ctx.guides[0].text}\n\nORIGEN:\n${ctx.source}`;
   const out=await localJSON(model,prompt,{maxTokens:32768});
   return {validation:normalizeArray(out.validation),warnings:normalizeArray(out.warnings),editorial_summary:ensureText(out.editorial_summary)||'Auditoría documental completada con Gemini.'};
-}
-
-export async function chooseVisualCandidate({model,action,candidates}){
-  const prompt=`Selecciona SOLO una captura que demuestre inequívocamente la acción indicada. Si ninguna demuestra el sistema y el elemento, rechaza. Devuelve JSON {"matched":false,"candidate_index":-1,"confidence":0.0,"evidence_summary":"","reject_reason":"","application_match":false,"element_match":false}.\nACCIÓN: ${JSON.stringify(action)}\nCANDIDATOS: ${JSON.stringify(candidates.map((c,i)=>({index:i,second:c.second,timestamp:c.timestamp})))}`;
-  return await localJSON(model,prompt,{images:candidates.map(c=>c.dataUrl.split(',')[1]),maxTokens:4096});
 }
 
 function normalizeSection(s={}){

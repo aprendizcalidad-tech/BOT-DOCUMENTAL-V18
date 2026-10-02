@@ -23,6 +23,9 @@ test('Worker crea análisis agentic de YouTube en background',async()=>{
   assert.equal(captured.body.input[0].type,'video');
   assert.equal(captured.body.input[0].processing,'agentic');
   assert.equal(captured.body.response_format.mime_type,'application/json');
+  const actionProps=captured.body.response_format.schema.properties.actions.items.properties;
+  assert.ok(actionProps.capture_timestamp);assert.ok(actionProps.capture_seconds);assert.ok(actionProps.capture_recommended);assert.ok(actionProps.capture_reason);
+  assert.match(captured.body.input[1].text,/NO extraigas, generes ni devuelvas imágenes/i);
   assert.equal(new Headers(captured.opts.headers).get('x-goog-api-key'),'secret-key');
  }finally{globalThis.fetch=original;}
 });

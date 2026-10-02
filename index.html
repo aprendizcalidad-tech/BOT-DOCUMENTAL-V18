@@ -15,7 +15,7 @@
 
   <header class="topbar">
     <div>
-      <div class="eyebrow">BOT DOCUMENTAL · V18 CLOUD</div>
+      <div class="eyebrow">BOT DOCUMENTAL · V18.1 CLOUD</div>
       <h1 id="appTitle">Generador documental inteligente</h1>
       <p id="appSubtitle" class="muted"></p>
     </div>
@@ -30,7 +30,7 @@
     <section class="hero panel">
       <div>
         <h2>De una guía y un origen a un documento institucional</h2>
-        <p>Interpreta hasta 8 guías, analiza PDF/DOCX/TXT o video, detecta brechas, permite corregir el borrador y genera Word + PDF. La IA y el video se procesan en la nube; no requiere Python, Ollama, Whisper ni FFmpeg en el computador.</p>
+        <p>Interpreta hasta 8 guías, analiza PDF/DOCX/TXT o video, genera el paso a paso y marca el minuto/segundo exacto donde conviene tomar cada captura manual. No extrae imágenes automáticamente. La IA y el video se procesan en la nube; no requiere Python, Ollama, Whisper ni FFmpeg en el computador.</p>
       </div>
       <div id="apiStatus" class="status-chip warn">Configura backend cloud</div>
     </section>
@@ -173,7 +173,6 @@
         <label>Modelo general<input id="cfgModel" class="input" value="gemini-3.7-flash" /></label>
         <label>Modelo para video<input id="cfgVideoModel" class="input" value="gemini-3.7-flash" /></label>
       </div>
-      <label class="hidden">Modelo visual<input id="cfgVisualModel" class="input" value="gemini-3.7-flash" /></label>
       <label>Google OAuth Client ID <span class="muted">(solo para Drive)</span><input id="cfgGoogleClientId" class="input" placeholder="...apps.googleusercontent.com" /></label>
       <div class="callout subtle">
         La API key de Gemini <b>no se escribe aquí</b>. Debe guardarse como secreto <code>GEMINI_API_KEY</code> en Cloudflare Worker. El token de la aplicación se conserva únicamente durante la sesión del navegador.

@@ -1,6 +1,6 @@
 window.BOT_CONFIG={
-  title:'Bot documental V18 · Cloud',
-  subtitle:'GitHub Pages + backend seguro + Gemini · Drive/YouTube · sin instalación local',
+  title:'Bot documental V18.1 · Cloud + Timestamps',
+  subtitle:'GitHub Pages + Gemini · guía automática + minuto exacto para capturas manuales',
   MAX_GUIDES:8,
   MAX_FILE_MB:50,
   MAX_GEMINI_VIDEO_BYTES:2147483648,

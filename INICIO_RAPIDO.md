@@ -51,3 +51,19 @@ No necesitas ejecutar ningún `.bat`, `.py`, `npm install` ni terminal para pone
 - `localhost:8765`
 
 El frontend sigue generando Word y PDF en el navegador.
+
+## Cambio V18.1 — capturas manuales por timestamp
+
+Esta variante ya **no extrae ni incrusta capturas del video**. Durante el análisis de video, Gemini devuelve para cada acción:
+
+- intervalo real de la acción (`timestamp_start` / `timestamp_end`),
+- `capture_timestamp`: minuto/segundo exacto recomendado para abrir el video,
+- `capture_seconds`: la misma referencia en segundos,
+- `capture_recommended`: indica si vale la pena tomar una captura,
+- `capture_reason`: qué debería verse en ese instante.
+
+En el borrador y en el Word/PDF cada paso queda, por ejemplo:
+
+`[ACC-00012] Selecciona Guardar · Video: 00:18:39–00:18:45 · Captura sugerida: 00:18:42`
+
+Así solo tienes que ir al minuto indicado, tomar la captura manualmente y pegarla donde corresponda si la necesitas.

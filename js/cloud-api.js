@@ -43,7 +43,7 @@ async function request(path, options = {}, retries = 4) {
       const response = await fetch(endpoint(path), {
         ...options,
         headers: headers(options.headers || {}),
-        signal: options.signal || AbortSignal.timeout(3_600_000)
+        signal: options.signal || AbortSignal.timeout(1_900_000)
       });
       if (response.ok) return response;
       const message = await parseError(response);
@@ -86,4 +86,3 @@ export async function cloudRaw(path, body, extraHeaders = {}, options = {}) {
     signal: options.signal
   }, options.retries ?? 4);
 }
- 

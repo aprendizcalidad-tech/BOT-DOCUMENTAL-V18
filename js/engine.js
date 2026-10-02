@@ -12,7 +12,7 @@ function activeJobFor(fingerprint){
     return value?.fingerprint===fingerprint&&value?.jobId?value:null;
   }catch{return null;}
 }
-function saveActive(jobId,name,fingerprint,extra={}){sessionStorage.setItem(ACTIVE_KEY,JSON.stringify({jobId,name,fingerprint,...extra,savedAt:new Date().toISOString()}));}
+function saveActive(jobId,name,fingerprint){sessionStorage.setItem(ACTIVE_KEY,JSON.stringify({jobId,name,fingerprint,savedAt:new Date().toISOString()}));}
 function clearActive(jobId){try{const v=JSON.parse(sessionStorage.getItem(ACTIVE_KEY)||'null');if(!jobId||v?.jobId===jobId)sessionStorage.removeItem(ACTIVE_KEY);}catch{sessionStorage.removeItem(ACTIVE_KEY);}}
 
 function fileObject(value){return value?.file || value || {};}
@@ -130,8 +130,19 @@ function normalizeTranscript(raw){
     location_path:String(a?.location_path||a?.system||'').trim(),
     interface_element:String(a?.interface_element||'').trim(),
     result:String(a?.result||'').trim(),
-    uncertainty:String(a?.uncertainty||'').trim()
-  })).filter(a=>a.action);
+    uncertainty:String(a?.uncertainty||'').trim(),
+    capture_recommended:a?.capture_recommended!==false,
+    capture_seconds:Number.isFinite(Number(a?.capture_seconds))?Number(a.capture_seconds):null,
+    capture_timestamp:String(a?.capture_timestamp||'').trim(),
+    capture_reason:String(a?.capture_reason||'').trim()
+  })).map(a=>{
+    const start=Number(a.start_seconds)||0,end=Math.max(start,Number(a.end_seconds)||start);
+    let sec=Number(a.capture_seconds);
+    if(!Number.isFinite(sec)||sec<start||sec>end)sec=start+(end-start)/2;
+    const total=Math.max(0,Math.round(sec)),h=Math.floor(total/3600),m=Math.floor((total%3600)/60),ss=total%60;
+    const fallback=h>0?`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+    return {...a,capture_seconds:sec,capture_timestamp:fallback};
+  }).filter(a=>a.action);
   t.full_transcript=String(t.full_transcript||'');
   t.uncertainties=Array.isArray(t.uncertainties)?t.uncertainties.map(String):[];
   t.duration_seconds=Number(t.duration_seconds)||Number(t.coverage?.duration_seconds)||0;
@@ -144,29 +155,6 @@ function normalizeTranscript(raw){
 
 async function startInteraction({uri,mimeType,youtubeUrl,model}){
   return await cloudJSON('/video/start',youtubeUrl?{youtubeUrl,model}:{uri,mimeType,model},{retries:3});
-}
-
-function isBlobstoreUriRegression(error){
-  return /Unsupported file uri:\s*blobstore:\/\//i.test(String(error?.message||error||''));
-}
-
-function isTransientVideoError(error){
-  const message=String(error?.message||error||'');
-  return isBlobstoreUriRegression(error)||/high demand|spikes in demand|try again later|temporar(?:y|ily)|overload|service unavailable|unavailable|resource[_ ]exhausted|rate limit|too many requests|deadline|timeout|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b/i.test(message);
-}
-
-async function analyzeDirect({uri,mimeType,youtubeUrl,model,onProgress=()=>{}}){
-  onProgress('Activando ruta AGENTIC con reintentos y cambio automático de modelo…',.62);
-  const payload=youtubeUrl?{youtubeUrl,model}:{uri,mimeType,model};
-  const result=await cloudJSON('/video/direct',payload,{retries:0});
-  const used=String(result?.modelUsed||model||'Gemini');
-  const fallbacks=Array.isArray(result?.fallbackTrace)?result.fallbackTrace:[];
-  if(fallbacks.length){
-    onProgress(`Gemini respondió con ${used} después de ${fallbacks.length} intento(s) alternativos.`,.95);
-  }else{
-    onProgress(`Gemini respondió con ${used}.`,.95);
-  }
-  return normalizeTranscript(result?.transcript||result);
 }
 
 export async function awaitJob(id,onProgress=()=>{}){
@@ -206,31 +194,17 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
     const active=activeJobFor(fingerprint);
     if(active){
       onProgress('Reanudando el análisis cloud que ya estaba en curso…',.56);
-      try{
-        const transcript=await awaitJob(active.jobId,onProgress);
-        clearActive(active.jobId);
-        return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
-      }catch(error){
-        clearActive(active.jobId);
-        if(!isTransientVideoError(error))throw error;
-        const transcript=await analyzeDirect({youtubeUrl:url,model,onProgress});
-        return {jobId:null,name:active.name||name,fingerprint,transcript};
-      }
+      const transcript=await awaitJob(active.jobId,onProgress);
+      clearActive(active.jobId);
+      return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
     }
     onProgress('Enviando referencia de YouTube a Gemini…',.12);
     const interaction=await startInteraction({youtubeUrl:url,model});
     if(!interaction?.id)throw new Error('Gemini no devolvió el ID del trabajo de video.');
-    saveActive(interaction.id,name,fingerprint,{youtubeUrl:url});
-    try{
-      const transcript=await awaitJob(interaction.id,onProgress);
-      clearActive(interaction.id);
-      return {jobId:interaction.id,name,fingerprint,transcript};
-    }catch(error){
-      clearActive(interaction.id);
-      if(!isTransientVideoError(error))throw error;
-      const transcript=await analyzeDirect({youtubeUrl:url,model,onProgress});
-      return {jobId:null,name,fingerprint,transcript};
-    }
+    saveActive(interaction.id,name,fingerprint);
+    const transcript=await awaitJob(interaction.id,onProgress);
+    clearActive(interaction.id);
+    return {jobId:interaction.id,name,fingerprint,transcript};
   }
 
   let meta;
@@ -251,19 +225,9 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
   const active=activeJobFor(fingerprint);
   if(active){
     onProgress('Reanudando el análisis cloud que ya estaba en curso…',.56);
-    try{
-      const transcript=await awaitJob(active.jobId,onProgress);
-      clearActive(active.jobId);
-      return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
-    }catch(error){
-      clearActive(active.jobId);
-      if(!isTransientVideoError(error))throw error;
-      if(active.uri){
-        const transcript=await analyzeDirect({uri:active.uri,mimeType:active.mimeType||mimeType,model,onProgress});
-        return {jobId:null,name:active.name||name,fingerprint,transcript};
-      }
-      onProgress('La sesión anterior de Gemini quedó inválida; reanudando desde una carga limpia…',.02);
-    }
+    const transcript=await awaitJob(active.jobId,onProgress);
+    clearActive(active.jobId);
+    return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
   }
 
   onProgress('Creando sesión de carga segura en Gemini…',.02);
@@ -277,15 +241,8 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
   onProgress('Iniciando análisis agentic del video completo…',.56);
   const interaction=await startInteraction({uri,mimeType,model});
   if(!interaction?.id)throw new Error('Gemini no devolvió el ID del trabajo de video.');
-  saveActive(interaction.id,name,fingerprint,{uri,mimeType});
-  try{
-    const transcript=await awaitJob(interaction.id,onProgress);
-    clearActive(interaction.id);
-    return {jobId:interaction.id,name,fingerprint,transcript};
-  }catch(error){
-    clearActive(interaction.id);
-    if(!isTransientVideoError(error))throw error;
-    const transcript=await analyzeDirect({uri,mimeType,model,onProgress});
-    return {jobId:null,name,fingerprint,transcript};
-  }
+  saveActive(interaction.id,name,fingerprint);
+  const transcript=await awaitJob(interaction.id,onProgress);
+  clearActive(interaction.id);
+  return {jobId:interaction.id,name,fingerprint,transcript};
 }

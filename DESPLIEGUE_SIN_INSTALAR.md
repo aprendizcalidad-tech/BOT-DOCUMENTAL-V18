@@ -158,3 +158,9 @@ Antes de usar un video de varias horas:
 4. Prueba una URL pública de YouTube.
 5. Verifica que el Word conserve todas las acciones `ACC-xxxxx`.
 6. Después prueba el video largo.
+
+## K. Capturas manuales por minuto exacto (V18.1)
+
+V18.1 elimina la extracción automática de frames. Gemini analiza la evidencia visual del video, pero devuelve únicamente marcas de tiempo. Para cada acción importante identifica el instante más claro para una captura manual. El Word/PDF conserva esa referencia junto al paso.
+
+Después de actualizar el frontend también debes volver a desplegar `worker/worker.js`, porque el esquema de análisis de video ahora incluye `capture_timestamp`, `capture_seconds`, `capture_recommended` y `capture_reason`.
