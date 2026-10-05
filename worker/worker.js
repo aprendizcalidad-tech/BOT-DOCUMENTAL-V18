@@ -106,15 +106,15 @@ async function handleFileStart(request, env) {
   const size = Number(body.size || 0);
   if (!Number.isFinite(size) || size <= 0) throw Object.assign(new Error('Tamaño de archivo inválido.'), {status:400});
   if (size > 2 * 1024 * 1024 * 1024) throw Object.assign(new Error('Gemini Files gratuito admite hasta 2 GB por archivo. Para videos mayores usa una URL pública de YouTube.'), {status:413});
-  const response = await fetch(`${GEMINI_BASE}/upload/v1beta/files?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
+  const response = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, {
     method:'POST',
-    headers:{
+    headers:apiHeaders(env, {
       'X-Goog-Upload-Protocol':'resumable',
       'X-Goog-Upload-Command':'start',
       'X-Goog-Upload-Header-Content-Length':String(size),
       'X-Goog-Upload-Header-Content-Type':mimeType,
       'Content-Type':'application/json'
-    },
+    }),
     body:JSON.stringify({file:{display_name:name}})
   });
   if (!response.ok) await upstreamJson(response);
@@ -282,9 +282,9 @@ ${guideContext}
 Devuelve exclusivamente JSON válido conforme al esquema.`;
 }
 
-async function handleVideoStart(request, env) {
+async function handleVideoStream(request, env, cors) {
   const body = await readJson(request);
-  const model = validateModel(body.model || 'gemini-3.7-flash');
+  const model = validateModel(body.model || 'gemini-3.8-flash');
   const guides = sanitizeGuides(body.guides);
   if (!guides.length) throw Object.assign(new Error('El análisis optimizado de video requiere al menos una guía institucional.'), {status:400});
   const input = [];
@@ -299,30 +299,29 @@ async function handleVideoStart(request, env) {
     input.push({type:'video', uri, mime_type:mimeType, processing:'agentic'});
   }
   input.push({type:'text', text:videoPrompt(guides)});
-  const response = await fetch(`${GEMINI_BASE}/v1beta/interactions`, {
+
+  // HOTFIX 2026-10-05: evitamos background:true + GET /interactions/{id}.
+  // Gemini está devolviendo "Multiple authentication credentials received" al recuperar
+  // algunas background interactions aun cuando se envía una sola x-goog-api-key.
+  // Streaming conserva una única interacción/model request y mantiene la conexión viva.
+  const response = await fetch(`${GEMINI_BASE}/v1beta/interactions?alt=sse`, {
     method:'POST',
     headers:apiHeaders(env, {'Content-Type':'application/json','Api-Revision':API_REVISION}),
     body:JSON.stringify({
       model,
       input,
-      background:true,
-      store:true,
+      stream:true,
+      store:false,
       generation_config:{temperature:0,max_output_tokens:65536},
       response_format:{type:'text',mime_type:'application/json',schema:VIDEO_SCHEMA}
     })
   });
-  return await upstreamJson(response);
-}
-
-async function handleInteractionResponse(id, env, cors) {
-  if (!/^v1_[A-Za-z0-9._-]+$/.test(id)) throw Object.assign(new Error('ID de interacción inválido.'), {status:400});
-  const response = await fetch(`${GEMINI_BASE}/v1beta/interactions/${encodeURIComponent(id)}`, {
-    headers:apiHeaders(env, {'Api-Revision':API_REVISION})
-  });
-  // El resultado de un video largo puede ser grande. Lo reenviamos como stream para ahorrar CPU/memoria del plan gratuito.
+  if (!response.ok) await upstreamJson(response);
   const headers = new Headers(cors || {});
-  headers.set('Content-Type', response.headers.get('Content-Type') || 'application/json; charset=utf-8');
-  return new Response(response.body, {status:response.status, headers});
+  headers.set('Content-Type', response.headers.get('Content-Type') || 'text/event-stream; charset=utf-8');
+  headers.set('Cache-Control','no-cache, no-transform');
+  headers.set('X-Accel-Buffering','no');
+  return new Response(response.body, {status:200, headers});
 }
 
 export default {
@@ -342,9 +341,7 @@ export default {
       if (url.pathname === '/files/chunk' && request.method === 'POST') return json(await handleFileChunk(request),200,cors);
       if (url.pathname === '/files/query' && request.method === 'POST') return json(await handleFileQuery(request),200,cors);
       if (url.pathname === '/files/status' && request.method === 'GET') return json(await handleFileStatus(url,env),200,cors);
-      if (url.pathname === '/video/start' && request.method === 'POST') return json(await handleVideoStart(request,env),200,cors);
-      const match = url.pathname.match(/^\/interactions\/(v1_[A-Za-z0-9._-]+)$/);
-      if (match && request.method === 'GET') return await handleInteractionResponse(match[1],env,cors);
+      if ((url.pathname === '/video/stream' || url.pathname === '/video/start') && request.method === 'POST') return await handleVideoStream(request,env,cors);
       return json({ok:false,error:'Ruta no encontrada.'},404,cors);
     } catch (error) {
       const status = Number(error?.status) || 500;

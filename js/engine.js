@@ -171,34 +171,84 @@ function normalizeTranscript(raw){
   return t;
 }
 
-async function startInteraction({uri,mimeType,youtubeUrl,model,guides}){
+async function startInteractionStream({uri,mimeType,youtubeUrl,model,guides,onProgress=()=>{}}){
   const payload={model,guides:buildGuidePayload(guides)};
   if(youtubeUrl)payload.youtubeUrl=youtubeUrl;
   else Object.assign(payload,{uri,mimeType});
-  return await cloudJSON('/video/start',payload,{retries:1});
-}
 
-export async function awaitJob(id,onProgress=()=>{}){
-  for(let i=0;i<2160;i++){
-    const interaction=await cloudJSON('/interactions/'+encodeURIComponent(id),undefined,{retries:5});
-    const status=String(interaction?.status||'').toLowerCase();
-    if(status==='completed'){
-      const text=extractOutputText(interaction);
-      if(!text)throw new Error('Gemini terminó el video pero no devolvió contenido.');
-      let raw;
-      try{raw=JSON.parse(cleanJsonText(text));}catch{throw new Error('La respuesta final del análisis de video no es JSON válido.');}
-      return normalizeTranscript(raw);
+  const response=await cloudRaw('/video/stream',JSON.stringify(payload),{'Content-Type':'application/json'},{retries:0});
+  if(!response.body)throw new Error('El navegador no pudo abrir el stream de Gemini.');
+
+  const reader=response.body.getReader();
+  const decoder=new TextDecoder();
+  let buffer='';
+  let output='';
+  let interactionId='';
+  let finalStatus='';
+  let lastProgressChars=0;
+
+  const processBlock=(block)=>{
+    const lines=String(block||'').split(/\r?\n/);
+    let eventName='';
+    const dataLines=[];
+    for(const line of lines){
+      if(line.startsWith('event:'))eventName=line.slice(6).trim();
+      else if(line.startsWith('data:'))dataLines.push(line.slice(5).trimStart());
     }
-    if(['failed','cancelled','canceled','incomplete'].includes(status)){
-      clearActive(id);
-      const reason=interaction?.error?.message||interaction?.error||status;
-      throw new Error('El análisis del video terminó con estado '+reason+'.');
+    const dataText=dataLines.join('\n').trim();
+    if(!dataText||dataText==='[DONE]')return;
+    let event;
+    try{event=JSON.parse(dataText);}catch{return;}
+    const type=String(event?.event_type||eventName||'');
+    if(type==='interaction.created'){
+      interactionId=String(event?.interaction?.id||interactionId||'');
+      onProgress('Gemini recibió el trabajo y está recorriendo el video…',.60);
+      return;
     }
-    const processingSteps=(interaction?.steps||[]).filter(s=>s?.type==='processing_result').length;
-    onProgress(processingSteps?`Gemini está recorriendo el video · ${processingSteps} segmentos consultados`:'Gemini está analizando el video en segundo plano…',.58+Math.min(.38,i/600*.38));
-    await sleep(5000);
+    if(type==='interaction.status_update'){
+      onProgress('Gemini continúa analizando el video completo…',.66);
+      return;
+    }
+    if(type==='step.delta'&&event?.delta?.type==='text'){
+      output+=String(event.delta.text||'');
+      if(output.length-lastProgressChars>=5000){
+        lastProgressChars=output.length;
+        onProgress(`Gemini está construyendo la guía · ${Math.max(1,Math.round(output.length/1000))}k caracteres recibidos`,.72+Math.min(.23,output.length/350000*.23));
+      }
+      return;
+    }
+    if(type==='interaction.completed'){
+      finalStatus=String(event?.interaction?.status||'completed').toLowerCase();
+      interactionId=String(event?.interaction?.id||interactionId||'');
+      return;
+    }
+    if(type.includes('error')||event?.error){
+      const message=event?.error?.message||event?.message||'Gemini interrumpió el stream.';
+      throw new Error(String(message));
+    }
+  };
+
+  while(true){
+    const {done,value}=await reader.read();
+    buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});
+    while(true){
+      const match=buffer.match(/\r?\n\r?\n/);
+      if(!match)break;
+      const idx=match.index;
+      const block=buffer.slice(0,idx);
+      buffer=buffer.slice(idx+match[0].length);
+      processBlock(block);
+    }
+    if(done)break;
   }
-  throw new Error('El análisis de video no terminó dentro de la sesión actual.');
+  if(buffer.trim())processBlock(buffer);
+  if(finalStatus&&finalStatus!=='completed')throw new Error(`El análisis del video terminó con estado ${finalStatus}.`);
+  if(!output.trim())throw new Error('Gemini terminó el análisis pero no devolvió contenido utilizable.');
+  let raw;
+  try{raw=JSON.parse(cleanJsonText(output));}
+  catch{throw new Error('La respuesta final del análisis de video no es JSON válido.');}
+  onProgress('Análisis completo recibido. Validando acciones y timestamps…',.98);
+  return {id:interactionId,transcript:normalizeTranscript(raw)};
 }
 
 export async function processVideo({file,driveReference,youtubeUrl,model,guides=[],onProgress=()=>{}}){
@@ -213,21 +263,10 @@ export async function processVideo({file,driveReference,youtubeUrl,model,guides=
     const url=String(youtubeUrl).trim();
     if(!url)throw new Error('Pega una URL pública de YouTube.');
     name='YouTube';
-    fingerprint=await fingerprintMeta({youtubeUrl:url,guideFingerprint,mode:'single-interaction-v18.2'});
-    const active=activeJobFor(fingerprint);
-    if(active){
-      onProgress('Reanudando el análisis cloud que ya estaba en curso…',.56);
-      const transcript=await awaitJob(active.jobId,onProgress);
-      clearActive(active.jobId);
-      return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
-    }
+    fingerprint=await fingerprintMeta({youtubeUrl:url,guideFingerprint,mode:'single-interaction-stream-v18.3'});
     onProgress('Enviando referencia de YouTube a Gemini…',.12);
-    const interaction=await startInteraction({youtubeUrl:url,model,guides});
-    if(!interaction?.id)throw new Error('Gemini no devolvió el ID del trabajo de video.');
-    saveActive(interaction.id,name,fingerprint);
-    const transcript=await awaitJob(interaction.id,onProgress);
-    clearActive(interaction.id);
-    return {jobId:interaction.id,name,fingerprint,transcript};
+    const result=await startInteractionStream({youtubeUrl:url,model,guides,onProgress});
+    return {jobId:result.id||'',name,fingerprint,transcript:result.transcript};
   }
 
   let meta;
@@ -236,21 +275,13 @@ export async function processVideo({file,driveReference,youtubeUrl,model,guides=
     if(!String(meta.mimeType||'').startsWith('video/'))throw new Error('El archivo seleccionado de Drive no es un video.');
     name=meta.name||name;
     mimeType=meta.mimeType||mimeType;
-    fingerprint=await fingerprintMeta({id:meta.id,name:meta.name,size:meta.size,modifiedTime:meta.modifiedTime,md5Checksum:meta.md5Checksum,guideFingerprint,mode:'single-interaction-v18.2'});
+    fingerprint=await fingerprintMeta({id:meta.id,name:meta.name,size:meta.size,modifiedTime:meta.modifiedTime,md5Checksum:meta.md5Checksum,guideFingerprint,mode:'single-interaction-stream-v18.3'});
   }else{
     if(!file)throw new Error('Selecciona un video.');
     name=file.name||name;
     mimeType=file.type||mimeType;
-    fingerprint=await fingerprintMeta({name:file.name,size:file.size,lastModified:file.lastModified,type:file.type,guideFingerprint,mode:'single-interaction-v18.2'});
+    fingerprint=await fingerprintMeta({name:file.name,size:file.size,lastModified:file.lastModified,type:file.type,guideFingerprint,mode:'single-interaction-stream-v18.3'});
     meta={name,size:file.size,mimeType};
-  }
-
-  const active=activeJobFor(fingerprint);
-  if(active){
-    onProgress('Reanudando el análisis cloud que ya estaba en curso…',.56);
-    const transcript=await awaitJob(active.jobId,onProgress);
-    clearActive(active.jobId);
-    return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
   }
 
   onProgress('Creando sesión de carga segura en Gemini…',.02);
@@ -261,11 +292,8 @@ export async function processVideo({file,driveReference,youtubeUrl,model,guides=
   mimeType=f.mimeType||f.mime_type||mimeType;
   if(!uri)throw new Error('No se obtuvo la URI activa del video en Gemini.');
 
-  onProgress('Iniciando una sola interacción: video + guía + borrador…',.56);
-  const interaction=await startInteraction({uri,mimeType,model,guides});
-  if(!interaction?.id)throw new Error('Gemini no devolvió el ID del trabajo de video.');
-  saveActive(interaction.id,name,fingerprint);
-  const transcript=await awaitJob(interaction.id,onProgress);
-  clearActive(interaction.id);
-  return {jobId:interaction.id,name,fingerprint,transcript};
+  onProgress('Iniciando una sola interacción en streaming: video + guía + borrador…',.56);
+  const result=await startInteractionStream({uri,mimeType,model,guides,onProgress});
+  return {jobId:result.id||'',name,fingerprint,transcript:result.transcript};
 }
+
