@@ -20,7 +20,7 @@ test('Flujo cloud usa backend seguro y conserva acciones ACC al regenerar',async
   else value={paragraphs:['Contenido regenerado'],numbered_items:[],tables:[],source_basis:['Origen']};
   return new Response(JSON.stringify(value),{status:200,headers:{'Content-Type':'application/json'}});
  };
- const guides=[{name:'Guía',text:'PASOS\nDocumentar cada acción.',structure:[{order:1,title:'PASOS'}]}],source={text:'El usuario abre el sistema.'},model='gemini-3.7-flash';
+ const guides=[{name:'Guía',text:'PASOS\nDocumentar cada acción.',structure:[{order:1,title:'PASOS'}]}],source={text:'El usuario abre el sistema.'},model='openai/gpt-oss-120b';
  const analysis=await analyzeLocal({model,guides,source});
  const doc=await generateDraftLocal({model,guides,source,analysis,answers:[]});
  doc.sections[0].numbered_items=['[ACC-00001] Abrir sistema'];
@@ -31,6 +31,6 @@ test('Flujo cloud usa backend seguro y conserva acciones ACC al regenerar',async
 });
 
 test('Un error del Worker no se interpreta como documento',async()=>{
- globalThis.fetch=async()=>new Response(JSON.stringify({ok:false,error:'Gemini no disponible'}),{status:400,headers:{'Content-Type':'application/json'}});
- await assert.rejects(()=>localJSON('gemini-3.7-flash','prompt'),/Gemini no disponible/);
+ globalThis.fetch=async()=>new Response(JSON.stringify({ok:false,error:'Groq no disponible'}),{status:400,headers:{'Content-Type':'application/json'}});
+ await assert.rejects(()=>localJSON('openai/gpt-oss-120b','prompt'),/Groq no disponible/);
 });

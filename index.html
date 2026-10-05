@@ -30,15 +30,15 @@
     <section class="hero panel">
       <div>
         <h2>De una guía y un origen a un documento institucional</h2>
-        <p>Interpreta hasta 8 guías y, cuando el origen es video, resuelve análisis, selección de guía, acciones, timestamps y borrador base en una sola interacción de Gemini. La auditoría final del video se hace localmente para no gastar solicitudes adicionales. No extrae imágenes automáticamente.</p>
+        <p>Interpreta hasta 8 guías y documenta videos sin Gemini. El video se guarda temporalmente en Backblaze B2, Deepgram genera la transcripción con tiempos y Groq convierte esa evidencia en acciones, estructura y borrador. No extrae imágenes: indica el minuto exacto para que hagas la captura manual.</p>
       </div>
       <div id="apiStatus" class="status-chip warn">Configura backend cloud</div>
     </section>
 
-    <section class="panel"><h3>Motor cloud</h3><p id="localDiagnostics">Configura la URL del Worker y comprueba la conexión.</p><div class="action-row"><button id="btnDiagnostics" class="btn secondary">Comprobar backend</button></div><div class="callout subtle">La clave de Gemini permanece como secreto en el backend. En video, el flujo normal usa 1 interacción de modelo; subir el archivo y consultar su estado no son llamadas de generación.</div></section>
+    <section class="panel"><h3>Motor cloud</h3><p id="localDiagnostics">Configura la URL del Worker y comprueba la conexión.</p><div class="action-row"><button id="btnDiagnostics" class="btn secondary">Comprobar backend</button></div><div class="callout subtle">Las claves de Deepgram y Groq permanecen como secretos del Worker. Los videos se cargan temporalmente en Backblaze B2 y se eliminan después del análisis correcto.</div></section>
     <section class="steps" aria-label="Flujo">
       <div class="step active" data-step="1"><span>1</span><b>Cargar</b><small>Guías y origen</small></div>
-      <div class="step" data-step="2"><span>2</span><b>Analizar</b><small>1 interacción + trazabilidad</small></div>
+      <div class="step" data-step="2"><span>2</span><b>Analizar</b><small>Deepgram + Groq + trazabilidad</small></div>
       <div class="step" data-step="3"><span>3</span><b>Completar</b><small>Brechas y borrador</small></div>
       <div class="step" data-step="4"><span>4</span><b>Generar</b><small>Word + PDF</small></div>
     </section>
@@ -66,11 +66,11 @@
           <div class="segmented">
             <button class="seg active" data-source-mode="local">Archivo local</button>
             <button class="seg" data-source-mode="drive">Google Drive</button>
-            <button class="seg" data-source-mode="youtube">YouTube</button>
+            <button class="seg" data-source-mode="remote">URL pública</button>
           </div>
 
           <div id="localSourcePane">
-            <p class="muted">PDF, DOCX, TXT o video compatible. Los videos se transmiten a Gemini; no se copian a una carpeta local. En el nivel gratuito, máximo 2 GB por video.</p>
+            <p class="muted">PDF, DOCX, TXT o video compatible. Los videos se suben por partes a Backblaze B2 y se procesan en la nube. No necesitas instalar Python, FFmpeg ni Ollama en el PC.</p>
             <label class="dropzone" for="sourceFile">
               <input id="sourceFile" type="file" accept=".pdf,.docx,.txt,.mp4,.mpeg,.mov,.avi,.flv,.mpg,.webm,.wmv,.3gp,.3gpp,video/*" />
               <strong>Seleccionar origen</strong>
@@ -80,17 +80,17 @@
           </div>
 
           <div id="driveSourcePane" class="hidden">
-            <p class="muted">Pega una URL o ID de un documento o video de Drive. La conexión usa OAuth desde el navegador. Los videos se leen por bloques y se envían a Gemini sin guardarlos en el PC. Máximo 2 GB por video en el nivel gratuito.</p>
+            <p class="muted">Pega una URL o ID de un documento o video de Drive. La conexión usa OAuth desde el navegador. Los videos se leen por bloques desde Drive y se cargan temporalmente a Backblaze B2 sin instalar software en el PC.</p>
             <input id="driveReference" class="input" placeholder="https://drive.google.com/file/d/... o ID" />
             <div class="inline-actions">
               <button id="btnConnectDrive" class="btn secondary">Conectar Drive</button>
               <span id="driveStatus" class="muted">No conectado</span>
             </div>
           </div>
-          <div id="youtubeSourcePane" class="hidden">
-            <p class="muted">Para videos muy largos o mayores de 2 GB, pega una URL <b>pública</b> de YouTube. Gemini puede analizarla directamente sin descargar el video en el navegador.</p>
-            <input id="youtubeReference" class="input" placeholder="https://www.youtube.com/watch?v=..." />
-            <div class="callout subtle">Debe ser un video público. Los videos privados o no listados no funcionan con la entrada directa de YouTube.</div>
+          <div id="remoteSourcePane" class="hidden">
+            <p class="muted">Si ya tienes el archivo alojado en una URL HTTPS pública directa, puedes usarla sin volver a subirlo a Backblaze B2. Debe apuntar al archivo de audio/video, no a una página de reproducción.</p>
+            <input id="remoteReference" class="input" placeholder="https://servidor.example.com/video.mp4" />
+            <div class="callout subtle">La URL debe ser accesible por Deepgram sin iniciar sesión y devolver directamente el archivo multimedia.</div>
           </div>
         </div>
       </div>
@@ -164,18 +164,18 @@
       <div class="section-heading"><div><span class="kicker">CONFIGURACIÓN</span><h2>Motor cloud</h2></div><button class="icon-btn" value="cancel">✕</button></div>
 
       <label>URL del backend Cloudflare Worker
-        <input id="cfgBackendUrl" class="input" placeholder="https://bot-documental-v18.tu-subdominio.workers.dev" />
+        <input id="cfgBackendUrl" class="input" placeholder="https://bot-documental-v19.tu-subdominio.workers.dev" />
       </label>
       <label>Token de la aplicación <span class="muted">(si configuraste APP_TOKEN en el Worker)</span>
         <input id="cfgAppToken" class="input" type="password" autocomplete="off" placeholder="Token privado" />
       </label>
       <div class="two-col settings-cols">
-        <label>Modelo general<input id="cfgModel" class="input" value="gemini-3.7-flash" /></label>
-        <label>Modelo para video<input id="cfgVideoModel" class="input" value="gemini-3.7-flash" /></label>
+        <label>Modelo documental (Groq)<input id="cfgModel" class="input" value="openai/gpt-oss-120b" /></label>
+        <label>Modelo de transcripción (Deepgram)<input id="cfgVideoModel" class="input" value="nova-3" /></label>
       </div>
       <label>Google OAuth Client ID <span class="muted">(solo para Drive)</span><input id="cfgGoogleClientId" class="input" placeholder="...apps.googleusercontent.com" /></label>
       <div class="callout subtle">
-        La API key de Gemini <b>no se escribe aquí</b>. Debe guardarse como secreto <code>GEMINI_API_KEY</code> en Cloudflare Worker. El token de la aplicación se conserva únicamente durante la sesión del navegador.
+        Las API keys <b>no se escriben aquí</b>. Guarda <code>GROQ_API_KEY</code>, <code>DEEPGRAM_API_KEY</code> y <code>MEDIA_SIGNING_SECRET</code> como secretos del Cloudflare Worker. El token de la aplicación se conserva únicamente durante la sesión del navegador.
       </div>
       <div class="action-row split"><button id="btnClearSettings" type="button" class="btn ghost danger">Borrar configuración</button><button id="btnSaveSettings" type="button" class="btn primary">Guardar</button></div>
     </form>

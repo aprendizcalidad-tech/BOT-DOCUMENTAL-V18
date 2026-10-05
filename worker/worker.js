@@ -1,7 +1,11 @@
-const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
-const API_REVISION = '2026-05-20';
 const MAX_GUIDES = 8;
-const MAX_GUIDE_CONTEXT_CHARS = 3_800_000;
+const MAX_GUIDE_CONTEXT_CHARS = 320_000;
+const MAX_JSON_BYTES = 8 * 1024 * 1024;
+const DEFAULT_DOC_MODEL = 'openai/gpt-oss-120b';
+const DEFAULT_STT_MODEL = 'nova-3';
+const GROQ_BASE = 'https://api.groq.com/openai/v1';
+const DEEPGRAM_BASE = 'https://api.deepgram.com/v1/listen';
+const MEDIA_TTL_SECONDS = 6 * 60 * 60;
 
 function allowedOrigins(env) {
   return String(env.ALLOWED_ORIGINS || '')
@@ -17,26 +21,40 @@ function corsHeaders(origin, env) {
   return {
     'Access-Control-Allow-Origin': origin || (list.includes('*') ? '*' : (list[0] || '*')),
     'Vary': 'Origin',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type,X-App-Token,X-Upload-URL,X-Upload-Offset,X-Upload-Final',
+    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type,X-App-Token,X-Upload-Key,X-Upload-Id,X-Part-Number',
     'Access-Control-Max-Age': '86400'
   };
 }
 
-function json(data, status, cors) {
+function json(data, status = 200, cors = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {'Content-Type':'application/json; charset=utf-8', ...(cors || {})}
+    headers: {'Content-Type': 'application/json; charset=utf-8', ...cors}
   });
 }
 
-async function upstreamJson(response) {
+function authOk(request, env) {
+  if (!env.APP_TOKEN) return true;
+  return request.headers.get('X-App-Token') === env.APP_TOKEN;
+}
+
+async function readJson(request) {
+  const size = Number(request.headers.get('content-length') || 0);
+  if (size > MAX_JSON_BYTES) throw Object.assign(new Error('Solicitud JSON demasiado grande.'), {status: 413});
+  return await request.json();
+}
+
+function cleanJsonText(text) {
+  return String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+}
+
+async function upstreamJson(response, provider = 'Servicio externo') {
   const text = await response.text();
   let body;
-  try { body = text ? JSON.parse(text) : {}; }
-  catch { body = {raw:text}; }
+  try { body = text ? JSON.parse(text) : {}; } catch { body = {raw: text}; }
   if (!response.ok) {
-    const message = body?.error?.message || body?.error || body?.message || text || `Gemini ${response.status}`;
+    const message = body?.error?.message || body?.err_msg || body?.error || body?.message || text || `${provider} ${response.status}`;
     const error = new Error(String(message));
     error.status = response.status;
     error.body = body;
@@ -45,307 +63,623 @@ async function upstreamJson(response) {
   return body;
 }
 
-function authOk(request, env) {
-  if (!env.APP_TOKEN) return true;
-  return request.headers.get('X-App-Token') === env.APP_TOKEN;
+function validateGroqModel(model) {
+  const value = String(model || DEFAULT_DOC_MODEL).trim();
+  if (!/^[a-z0-9._\/-]+$/i.test(value)) throw Object.assign(new Error('Modelo Groq inválido.'), {status: 400});
+  return value;
 }
 
-function apiHeaders(env, extra = {}) {
-  if (!env.GEMINI_API_KEY) throw new Error('Falta el secreto GEMINI_API_KEY en el Worker.');
-  return {'x-goog-api-key': env.GEMINI_API_KEY, ...extra};
+function validateSttModel(model) {
+  const value = String(model || DEFAULT_STT_MODEL).trim();
+  if (!/^[a-z0-9._-]+$/i.test(value)) throw Object.assign(new Error('Modelo Deepgram inválido.'), {status: 400});
+  return value;
 }
 
-async function readJson(request) {
-  const size = Number(request.headers.get('content-length') || 0);
-  if (size > 6 * 1024 * 1024) throw Object.assign(new Error('Solicitud JSON demasiado grande.'), {status:413});
-  return await request.json();
+function requireServices(env, {groq = false, deepgram = false, b2 = false} = {}) {
+  if (groq && !env.GROQ_API_KEY) throw new Error('Falta el secreto GROQ_API_KEY en el Worker.');
+  if (deepgram && !env.DEEPGRAM_API_KEY) throw new Error('Falta el secreto DEEPGRAM_API_KEY en el Worker.');
+  if (b2) {
+    if (!env.B2_APPLICATION_KEY_ID) throw new Error('Falta B2_APPLICATION_KEY_ID en el Worker.');
+    if (!env.B2_APPLICATION_KEY) throw new Error('Falta el secreto B2_APPLICATION_KEY en el Worker.');
+    if (!env.B2_BUCKET_ID) throw new Error('Falta B2_BUCKET_ID en el Worker.');
+    if (!env.B2_BUCKET_NAME) throw new Error('Falta B2_BUCKET_NAME en el Worker.');
+  }
 }
 
-function validateModel(model) {
-  model = String(model || '').trim();
-  if (!/^gemini-[a-z0-9._-]+$/i.test(model)) throw Object.assign(new Error('Modelo Gemini inválido.'), {status:400});
-  return model;
+async function groqJSON(env, {model, prompt, maxTokens = 32768, schema = null}) {
+  requireServices(env, {groq: true});
+  const primary = validateGroqModel(model || env.GROQ_MODEL || DEFAULT_DOC_MODEL);
+  const fallback = String(env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-20b').trim();
+  const models = [...new Set([primary, fallback].filter(Boolean))];
+  let lastError;
+
+  for (let i = 0; i < models.length; i++) {
+    const current = models[i];
+    const payload = {
+      model: current,
+      temperature: 0,
+      max_completion_tokens: Math.min(Math.max(Number(maxTokens) || 8192, 512), 65536),
+      messages: [
+        {role: 'system', content: 'Eres un analista documental preciso. Devuelve únicamente JSON válido. No inventes hechos que no estén sustentados por la evidencia suministrada.'},
+        {role: 'user', content: String(prompt || '')}
+      ],
+      response_format: schema ? {
+        type: 'json_schema',
+        json_schema: {name: 'documentador_response', strict: true, schema}
+      } : {type: 'json_object'}
+    };
+
+    const response = await fetch(`${GROQ_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      try { await upstreamJson(response, 'Groq'); }
+      catch (error) {
+        lastError = error;
+        const retryable = [429, 500, 502, 503, 504].includes(Number(error.status));
+        if (!retryable || i === models.length - 1) throw error;
+        continue;
+      }
+    }
+
+    const data = await response.json();
+    const text = data?.choices?.[0]?.message?.content || '';
+    if (!String(text).trim()) {
+      lastError = new Error(`Groq (${current}) devolvió una respuesta vacía.`);
+      if (i === models.length - 1) throw lastError;
+      continue;
+    }
+    try { return JSON.parse(cleanJsonText(text)); }
+    catch {
+      lastError = new Error(`Groq (${current}) no devolvió JSON válido.`);
+      if (i === models.length - 1) throw lastError;
+    }
+  }
+  throw lastError || new Error('No fue posible obtener respuesta de Groq.');
 }
 
 async function handleChat(request, env) {
   const body = await readJson(request);
-  const model = validateModel(body.model || 'gemini-3.7-flash');
-  const prompt = String(body.prompt || '');
-  if (!prompt.trim()) throw Object.assign(new Error('Prompt vacío.'), {status:400});
-  const images = Array.isArray(body.images) ? body.images.slice(0, 8) : [];
-  const parts = [{text:prompt}];
-  for (const image of images) {
-    if (typeof image === 'string' && image.length) parts.push({inline_data:{mime_type:'image/jpeg',data:image}});
+  const prompt = String(body.prompt || '').trim();
+  if (!prompt) throw Object.assign(new Error('Prompt vacío.'), {status: 400});
+  return await groqJSON(env, {
+    model: body.model,
+    prompt,
+    maxTokens: body.maxTokens,
+    schema: body.schema && typeof body.schema === 'object' ? body.schema : null
+  });
+}
+
+function safeFileName(name) {
+  return String(name || 'video')
+    .normalize('NFKD')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 120) || 'video';
+}
+
+function randomId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+let b2AuthCache = null;
+
+async function b2Authorize(env, force = false) {
+  requireServices(env, {b2: true});
+  const keyId = String(env.B2_APPLICATION_KEY_ID || '').trim();
+  if (!force && b2AuthCache && b2AuthCache.keyId === keyId && b2AuthCache.expiresAt > Date.now()) return b2AuthCache;
+  const basic = btoa(`${keyId}:${String(env.B2_APPLICATION_KEY || '')}`);
+  const response = await fetch('https://api.backblazeb2.com/b2api/v4/b2_authorize_account', {
+    method: 'GET',
+    headers: {'Authorization': `Basic ${basic}`}
+  });
+  const data = await upstreamJson(response, 'Backblaze B2');
+  const storage = data?.apiInfo?.storageApi || {};
+  if (!data?.authorizationToken || !storage?.apiUrl || !storage?.downloadUrl) {
+    throw new Error('Backblaze B2 no devolvió la configuración de Storage API esperada.');
   }
-  const generationConfig = {
-    temperature: 0,
-    maxOutputTokens: Math.min(Math.max(Number(body.maxTokens) || 8192, 512), 65536),
-    responseMimeType: 'application/json'
+  b2AuthCache = {
+    keyId,
+    accountId: String(data.accountId || ''),
+    authorizationToken: String(data.authorizationToken),
+    apiUrl: String(storage.apiUrl),
+    downloadUrl: String(storage.downloadUrl),
+    absoluteMinimumPartSize: Number(storage.absoluteMinimumPartSize || 5_000_000),
+    recommendedPartSize: Number(storage.recommendedPartSize || 100_000_000),
+    expiresAt: Date.now() + 20 * 60 * 60 * 1000
   };
-  if (body.schema && typeof body.schema === 'object') generationConfig.responseSchema = body.schema;
-  const response = await fetch(`${GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method:'POST',
-    headers:apiHeaders(env, {'Content-Type':'application/json'}),
-    body:JSON.stringify({contents:[{role:'user',parts}], generationConfig})
-  });
-  const data = await upstreamJson(response);
-  const text = (data.candidates || []).flatMap(c => c?.content?.parts || []).map(p => p?.text || '').join('').trim();
-  if (!text) throw Object.assign(new Error(data?.promptFeedback?.blockReason ? `Gemini bloqueó la respuesta: ${data.promptFeedback.blockReason}` : 'Gemini devolvió una respuesta vacía.'), {status:502});
-  try { return JSON.parse(text); }
-  catch {
-    const cleaned = text.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim();
-    try { return JSON.parse(cleaned); }
-    catch { throw Object.assign(new Error('Gemini no devolvió JSON válido.'), {status:502}); }
-  }
+  return b2AuthCache;
 }
 
-async function handleFileStart(request, env) {
-  const body = await readJson(request);
-  const name = String(body.name || 'video').slice(0, 180);
-  const mimeType = String(body.mimeType || 'video/mp4').slice(0, 120);
-  const size = Number(body.size || 0);
-  if (!Number.isFinite(size) || size <= 0) throw Object.assign(new Error('Tamaño de archivo inválido.'), {status:400});
-  if (size > 2 * 1024 * 1024 * 1024) throw Object.assign(new Error('Gemini Files gratuito admite hasta 2 GB por archivo. Para videos mayores usa una URL pública de YouTube.'), {status:413});
-  const response = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, {
-    method:'POST',
-    headers:apiHeaders(env, {
-      'X-Goog-Upload-Protocol':'resumable',
-      'X-Goog-Upload-Command':'start',
-      'X-Goog-Upload-Header-Content-Length':String(size),
-      'X-Goog-Upload-Header-Content-Type':mimeType,
-      'Content-Type':'application/json'
-    }),
-    body:JSON.stringify({file:{display_name:name}})
-  });
-  if (!response.ok) await upstreamJson(response);
-  const uploadUrl = response.headers.get('x-goog-upload-url');
-  if (!uploadUrl) throw Object.assign(new Error('Google no devolvió la sesión de carga reanudable.'), {status:502});
-  return {ok:true, uploadUrl, name, mimeType, size};
-}
-
-async function handleFileChunk(request) {
-  const uploadUrl = request.headers.get('X-Upload-URL') || '';
-  if (!/^https:\/\/.*googleapis\.com\//i.test(uploadUrl)) throw Object.assign(new Error('Sesión de carga inválida.'), {status:400});
-  const offset = Number(request.headers.get('X-Upload-Offset') || 0);
-  const final = request.headers.get('X-Upload-Final') === '1';
-  if (!Number.isSafeInteger(offset) || offset < 0) throw Object.assign(new Error('Offset de carga inválido.'), {status:400});
-  const contentLength = Number(request.headers.get('content-length') || 0);
-  if (!Number.isSafeInteger(contentLength) || contentLength <= 0) throw Object.assign(new Error('No se pudo determinar el tamaño del bloque.'), {status:411});
-  if (contentLength > 64 * 1024 * 1024) throw Object.assign(new Error('Bloque demasiado grande; usa 16 MB.'), {status:413});
-  // Transmitimos el stream directamente a Gemini: el Worker no guarda el bloque en memoria ni en disco.
-  const response = await fetch(uploadUrl, {
-    method:'POST',
-    headers:{
-      'Content-Length':String(contentLength),
-      'X-Goog-Upload-Offset':String(offset),
-      'X-Goog-Upload-Command': final ? 'upload, finalize' : 'upload'
+async function b2Api(env, endpoint, body, retry = true) {
+  const auth = await b2Authorize(env);
+  const response = await fetch(`${auth.apiUrl}/b2api/v4/${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': auth.authorizationToken,
+      'Content-Type': 'application/json'
     },
-    body:request.body
+    body: JSON.stringify(body || {})
   });
-  const text = await response.text();
-  if (!response.ok) {
-    let message = text;
-    try { message = JSON.parse(text)?.error?.message || text; } catch {}
-    throw Object.assign(new Error(message || `Carga Gemini ${response.status}`), {status:response.status});
+  if (response.status === 401 && retry) {
+    b2AuthCache = null;
+    return await b2Api(env, endpoint, body, false);
   }
-  if (!final) return {ok:true, offset: offset + contentLength};
-  let data;
-  try { data = JSON.parse(text); } catch { throw Object.assign(new Error('Respuesta final de Files API inválida.'), {status:502}); }
-  return {ok:true, ...data};
+  return await upstreamJson(response, 'Backblaze B2');
 }
 
-async function handleFileQuery(request) {
-  const uploadUrl = request.headers.get('X-Upload-URL') || '';
-  if (!/^https:\/\/.*googleapis\.com\//i.test(uploadUrl)) throw Object.assign(new Error('Sesión de carga inválida.'), {status:400});
-  const response = await fetch(uploadUrl, {
-    method:'POST',
-    headers:{'Content-Length':'0','X-Goog-Upload-Command':'query'}
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    let message = text;
-    try { message = JSON.parse(text)?.error?.message || text; } catch {}
-    throw Object.assign(new Error(message || `Consulta de carga Gemini ${response.status}`), {status:response.status});
-  }
-  const received = Number(response.headers.get('x-goog-upload-size-received') || 0);
-  const status = String(response.headers.get('x-goog-upload-status') || 'active').toLowerCase();
-  return {ok:true, offset:Number.isSafeInteger(received) ? received : 0, status};
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function handleFileStatus(url, env) {
-  const name = url.searchParams.get('name') || '';
-  if (!/^files\/[A-Za-z0-9._-]+$/.test(name)) throw Object.assign(new Error('Nombre de archivo Gemini inválido.'), {status:400});
-  const response = await fetch(`${GEMINI_BASE}/v1beta/${name}`, {headers:apiHeaders(env)});
-  return await upstreamJson(response);
+async function sha1Hex(buffer) {
+  return bytesToHex(await crypto.subtle.digest('SHA-1', buffer));
 }
+
+async function handleMediaCreate(request, env) {
+  requireServices(env, {b2: true});
+  const body = await readJson(request);
+  const name = safeFileName(body.name);
+  const size = Number(body.size || 0);
+  const mimeType = String(body.mimeType || 'video/mp4').slice(0, 120);
+  if (!Number.isFinite(size) || size <= 0) throw Object.assign(new Error('Tamaño de video inválido.'), {status: 400});
+  const key = `videos/${Date.now()}-${randomId()}-${name}`;
+  const started = await b2Api(env, 'b2_start_large_file', {
+    bucketId: String(env.B2_BUCKET_ID),
+    fileName: key,
+    contentType: mimeType,
+    fileInfo: {originalName: name, expectedSize: String(size)}
+  });
+  const auth = await b2Authorize(env);
+  const preferred = Math.max(auth.absoluteMinimumPartSize || 5_000_000, Math.min(32 * 1024 * 1024, auth.recommendedPartSize || 32 * 1024 * 1024));
+  return {ok: true, key, uploadId: String(started.fileId), partSize: preferred, storage: 'Backblaze B2'};
+}
+
+async function handleMediaPart(request, env) {
+  requireServices(env, {b2: true});
+  const key = request.headers.get('X-Upload-Key') || '';
+  const uploadId = request.headers.get('X-Upload-Id') || '';
+  const partNumber = Number(request.headers.get('X-Part-Number') || 0);
+  if (!key.startsWith('videos/') || !uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
+    throw Object.assign(new Error('Datos de parte multipart inválidos.'), {status: 400});
+  }
+  const declaredLength = Number(request.headers.get('content-length') || 0);
+  if (declaredLength > 96 * 1024 * 1024) throw Object.assign(new Error('Parte de video demasiado grande.'), {status: 413});
+  const bytes = await request.arrayBuffer();
+  if (!bytes.byteLength || bytes.byteLength > 96 * 1024 * 1024) throw Object.assign(new Error('Parte de video inválida o demasiado grande.'), {status: 413});
+  const digest = await sha1Hex(bytes);
+  const target = await b2Api(env, 'b2_get_upload_part_url', {fileId: uploadId});
+  const response = await fetch(String(target.uploadUrl), {
+    method: 'POST',
+    headers: {
+      'Authorization': String(target.authorizationToken),
+      'X-Bz-Part-Number': String(partNumber),
+      'X-Bz-Content-Sha1': digest,
+      'Content-Length': String(bytes.byteLength)
+    },
+    body: bytes
+  });
+  const uploaded = await upstreamJson(response, 'Backblaze B2 upload');
+  const sha1 = String(uploaded.contentSha1 || digest);
+  return {ok: true, partNumber: Number(uploaded.partNumber || partNumber), etag: sha1, sha1};
+}
+
+async function handleMediaComplete(request, env) {
+  requireServices(env, {b2: true});
+  const body = await readJson(request);
+  const key = String(body.key || '');
+  const uploadId = String(body.uploadId || '');
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  if (!key.startsWith('videos/') || !uploadId || !parts.length) throw Object.assign(new Error('Carga multipart incompleta.'), {status: 400});
+  const normalized = parts.map(p => ({partNumber: Number(p.partNumber), sha1: String(p.sha1 || p.etag || '')})).sort((a, b) => a.partNumber - b.partNumber);
+  if (normalized.some((p, i) => !Number.isInteger(p.partNumber) || p.partNumber !== i + 1 || !/^[a-f0-9]{40}$/i.test(p.sha1))) {
+    throw Object.assign(new Error('Lista de partes o SHA1 inválidos.'), {status: 400});
+  }
+  const done = await b2Api(env, 'b2_finish_large_file', {fileId: uploadId, partSha1Array: normalized.map(p => p.sha1)});
+  return {
+    ok: true,
+    key: String(done.fileName || key),
+    fileId: String(done.fileId || uploadId),
+    size: Number(done.contentLength || 0),
+    contentSha1: String(done.contentSha1 || 'none'),
+    storage: 'Backblaze B2'
+  };
+}
+
+async function handleMediaAbort(request, env) {
+  requireServices(env, {b2: true});
+  const body = await readJson(request);
+  const uploadId = String(body.uploadId || '');
+  if (uploadId) await b2Api(env, 'b2_cancel_large_file', {fileId: uploadId}).catch(() => {});
+  return {ok: true};
+}
+
+function base64Url(bytes) {
+  let binary = '';
+  for (const b of new Uint8Array(bytes)) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function mediaSignature(env, key, exp) {
+  const secret = String(env.MEDIA_SIGNING_SECRET || env.APP_TOKEN || '');
+  if (!secret) throw new Error('Configura MEDIA_SIGNING_SECRET (o APP_TOKEN) para proteger los videos temporales.');
+  const cryptoKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), {name: 'HMAC', hash: 'SHA-256'}, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(`${key}|${exp}`));
+  return base64Url(sig);
+}
+
+async function signedMediaUrl(request, env, key) {
+  const exp = Math.floor(Date.now() / 1000) + MEDIA_TTL_SECONDS;
+  const sig = await mediaSignature(env, key, exp);
+  const u = new URL('/media/file', request.url);
+  u.searchParams.set('key', key);
+  u.searchParams.set('exp', String(exp));
+  u.searchParams.set('sig', sig);
+  return u.toString();
+}
+
+function encodedB2Path(name) {
+  return String(name || '').split('/').map(part => encodeURIComponent(part)).join('/');
+}
+
+async function handleMediaFile(request, env) {
+  requireServices(env, {b2: true});
+  const url = new URL(request.url);
+  const key = url.searchParams.get('key') || '';
+  const exp = Number(url.searchParams.get('exp') || 0);
+  const sig = url.searchParams.get('sig') || '';
+  if (!key.startsWith('videos/') || !Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return new Response('Expired', {status: 403});
+  const expected = await mediaSignature(env, key, exp);
+  if (sig !== expected) return new Response('Forbidden', {status: 403});
+  const auth = await b2Authorize(env);
+  const direct = `${auth.downloadUrl}/file/${encodeURIComponent(String(env.B2_BUCKET_NAME))}/${encodedB2Path(key)}`;
+  const upstreamHeaders = new Headers({'Authorization': auth.authorizationToken});
+  const range = request.headers.get('Range');
+  if (range) upstreamHeaders.set('Range', range);
+  let response = await fetch(direct, {method: 'GET', headers: upstreamHeaders});
+  if (response.status === 401) {
+    b2AuthCache = null;
+    const fresh = await b2Authorize(env, true);
+    upstreamHeaders.set('Authorization', fresh.authorizationToken);
+    response = await fetch(`${fresh.downloadUrl}/file/${encodeURIComponent(String(env.B2_BUCKET_NAME))}/${encodedB2Path(key)}`, {method: 'GET', headers: upstreamHeaders});
+  }
+  if (!response.ok && response.status !== 206) return new Response(await response.text().catch(() => 'Backblaze download error'), {status: response.status});
+  const headers = new Headers();
+  for (const h of ['content-type','content-length','content-range','etag','last-modified','x-bz-content-sha1']) {
+    const value = response.headers.get(h);
+    if (value) headers.set(h, value);
+  }
+  headers.set('Accept-Ranges', 'bytes');
+  return new Response(response.body, {status: response.status, headers});
+}
+
+async function deleteB2File(env, fileName, fileId) {
+  if (!fileName || !fileId) return;
+  await b2Api(env, 'b2_delete_file_version', {fileName, fileId});
+}
+
+function secToStamp(value) {
+  const total = Math.max(0, Math.round(Number(value) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function extractDeepgramTranscript(data) {
+  const duration = Number(data?.metadata?.duration || 0);
+  const detectedLanguage = String(data?.results?.channels?.[0]?.detected_language || data?.results?.channels?.[0]?.alternatives?.[0]?.languages?.[0] || 'es');
+  let utterances = Array.isArray(data?.results?.utterances) ? data.results.utterances : [];
+  if (!utterances.length) {
+    const words = data?.results?.channels?.[0]?.alternatives?.[0]?.words || [];
+    let current = null;
+    for (const w of words) {
+      const start = Number(w.start || 0), end = Number(w.end || start);
+      if (!current || start - current.end > 1.5 || current.text.length > 700) {
+        if (current) utterances.push(current);
+        current = {start, end, transcript: String(w.punctuated_word || w.word || '')};
+      } else {
+        current.end = end;
+        current.transcript += ` ${String(w.punctuated_word || w.word || '')}`;
+      }
+    }
+    if (current) utterances.push(current);
+  }
+  utterances = utterances.map(u => ({
+    start: Number(u.start || 0),
+    end: Number(u.end || u.start || 0),
+    text: String(u.transcript || u.text || '').trim()
+  })).filter(u => u.text);
+  const full = String(data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || utterances.map(u => u.text).join(' ')).trim();
+  return {duration, detectedLanguage, utterances, full};
+}
+
+function chunkUtterances(utterances, maxChars = 30_000, maxSeconds = 1800) {
+  const chunks = [];
+  let current = [];
+  let chars = 0;
+  let start = null;
+  for (const u of utterances) {
+    const line = `[${secToStamp(u.start)}-${secToStamp(u.end)}] ${u.text}`;
+    const span = start == null ? 0 : u.end - start;
+    if (current.length && (chars + line.length > maxChars || span > maxSeconds)) {
+      chunks.push(current);
+      current = [];
+      chars = 0;
+      start = null;
+    }
+    if (start == null) start = u.start;
+    current.push(u);
+    chars += line.length + 1;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+const ACTION_CHUNK_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    summary: {type: 'string'},
+    uncertainties: {type: 'array', items: {type: 'string'}},
+    actions: {type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        action: {type: 'string'}, start_seconds: {type: 'number'}, end_seconds: {type: 'number'},
+        system: {type: 'string'}, location_path: {type: 'string'}, interface_element: {type: 'string'},
+        result: {type: 'string'}, uncertainty: {type: 'string'}, capture_recommended: {type: 'boolean'},
+        capture_seconds: {type: 'number'}, capture_reason: {type: 'string'}
+      },
+      required: ['action','start_seconds','end_seconds','system','location_path','interface_element','result','uncertainty','capture_recommended','capture_seconds','capture_reason']
+    }}
+  },
+  required: ['summary','uncertainties','actions']
+};
 
 const ANALYSIS_SCHEMA = {
-  type:'object',
-  properties:{
-    detected_process:{type:'string'},
-    selected_guide_index:{type:'integer'},
-    selection_reason:{type:'string'},
-    proposed_document_title:{type:'string'},
-    supporting_guide_indices:{type:'array',items:{type:'integer'}},
-    general_requirements:{type:'array',items:{type:'string'}},
-    sections:{type:'array',items:{
-      type:'object',
-      properties:{
-        order:{type:'integer'},title:{type:'string'},guide_instruction:{type:'string'},
-        criteria:{type:'array',items:{type:'string'}},required:{type:'boolean'},status:{type:'string'},
-        evidence:{type:'array',items:{type:'string'}},draft_content:{type:'string'},
-        missing_questions:{
-          type:'array',
-          items:{
-            type:'object',
-            properties:{category:{type:'string'},question:{type:'string'},why_needed:{type:'string'},required:{type:'boolean'}},
-            required:['category','question','why_needed','required']
-          }
-        }
+  type: 'object', additionalProperties: false,
+  properties: {
+    detected_process: {type: 'string'}, selected_guide_index: {type: 'integer'}, selection_reason: {type: 'string'},
+    proposed_document_title: {type: 'string'}, supporting_guide_indices: {type: 'array', items: {type: 'integer'}},
+    general_requirements: {type: 'array', items: {type: 'string'}},
+    sections: {type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        order: {type: 'integer'}, title: {type: 'string'}, guide_instruction: {type: 'string'},
+        criteria: {type: 'array', items: {type: 'string'}}, required: {type: 'boolean'}, status: {type: 'string'},
+        evidence: {type: 'array', items: {type: 'string'}}, draft_content: {type: 'string'},
+        missing_questions: {type: 'array', items: {
+          type: 'object', additionalProperties: false,
+          properties: {category:{type:'string'}, question:{type:'string'}, why_needed:{type:'string'}, required:{type:'boolean'}},
+          required: ['category','question','why_needed','required']
+        }}
       },
-      required:['order','title','guide_instruction','criteria','required','status','evidence','draft_content','missing_questions']
+      required: ['order','title','guide_instruction','criteria','required','status','evidence','draft_content','missing_questions']
     }},
-    warnings:{type:'array',items:{type:'string'}}
+    warnings: {type: 'array', items: {type: 'string'}}
   },
-  required:['detected_process','selected_guide_index','selection_reason','proposed_document_title','supporting_guide_indices','general_requirements','sections','warnings']
+  required: ['detected_process','selected_guide_index','selection_reason','proposed_document_title','supporting_guide_indices','general_requirements','sections','warnings']
 };
 
 const DOCUMENT_SECTION_SCHEMA = {
-  type:'object',
-  properties:{
-    order:{type:'integer'},title:{type:'string'},
-    paragraphs:{type:'array',items:{type:'string'}},
-    bullets:{type:'array',items:{type:'string'}},
-    numbered_items:{type:'array',items:{type:'string'}},
-    tables:{type:'array',items:{type:'object',properties:{title:{type:'string'},headers:{type:'array',items:{type:'string'}},rows:{type:'array',items:{type:'array',items:{type:'string'}}}},required:['title','headers','rows']}},
+  type: 'object', additionalProperties: false,
+  properties: {
+    order:{type:'integer'}, title:{type:'string'}, paragraphs:{type:'array',items:{type:'string'}},
+    bullets:{type:'array',items:{type:'string'}}, numbered_items:{type:'array',items:{type:'string'}},
+    tables:{type:'array',items:{type:'object',additionalProperties:false,properties:{title:{type:'string'},headers:{type:'array',items:{type:'string'}},rows:{type:'array',items:{type:'array',items:{type:'string'}}}},required:['title','headers','rows']}},
     source_basis:{type:'array',items:{type:'string'}}
   },
   required:['order','title','paragraphs','bullets','numbered_items','tables','source_basis']
 };
 
 const DRAFT_SCHEMA = {
-  type:'object',
-  properties:{
-    title:{type:'string'},subtitle:{type:'string'},introductory_note:{type:'string'},
-    sections:{type:'array',items:DOCUMENT_SECTION_SCHEMA},warnings:{type:'array',items:{type:'string'}}
+  type: 'object', additionalProperties: false,
+  properties: {
+    title:{type:'string'}, subtitle:{type:'string'}, introductory_note:{type:'string'},
+    sections:{type:'array',items:DOCUMENT_SECTION_SCHEMA}, warnings:{type:'array',items:{type:'string'}}
   },
   required:['title','subtitle','introductory_note','sections','warnings']
 };
 
-const VIDEO_SCHEMA = {
-  type:'object',
-  properties:{
-    duration_seconds:{type:'number'},
-    duration_estimate:{type:'string'},
-    detected_language:{type:'string'},
-    full_transcript:{type:'string'},
-    transcript_segments:{type:'array',items:{type:'object',properties:{start:{type:'string'},end:{type:'string'},text:{type:'string'}},required:['start','end','text']}},
-    actions:{type:'array',items:{type:'object',properties:{action:{type:'string'},timestamp_start:{type:'string'},timestamp_end:{type:'string'},start_seconds:{type:'number'},end_seconds:{type:'number'},system:{type:'string'},location_path:{type:'string'},interface_element:{type:'string'},result:{type:'string'},uncertainty:{type:'string'},capture_recommended:{type:'boolean'},capture_timestamp:{type:'string'},capture_seconds:{type:'number'},capture_reason:{type:'string'}},required:['action','timestamp_start','timestamp_end','start_seconds','end_seconds','system','location_path','interface_element','result','uncertainty','capture_recommended','capture_timestamp','capture_seconds','capture_reason']}},
-    uncertainties:{type:'array',items:{type:'string'}},
-    coverage:{type:'object',properties:{complete:{type:'boolean'},duration_seconds:{type:'number'},scope:{type:'string'},last_timestamp:{type:'string'}},required:['complete','duration_seconds','scope','last_timestamp']},
-    document_analysis:ANALYSIS_SCHEMA,
-    document_draft:DRAFT_SCHEMA,
-    optimization:{type:'object',properties:{mode:{type:'string'},model_requests_planned:{type:'integer'},notes:{type:'string'}},required:['mode','model_requests_planned','notes']}
-  },
-  required:['duration_seconds','duration_estimate','detected_language','full_transcript','actions','uncertainties','coverage','document_analysis','document_draft','optimization']
+const BUNDLE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {document_analysis: ANALYSIS_SCHEMA, document_draft: DRAFT_SCHEMA},
+  required: ['document_analysis','document_draft']
 };
 
 function sanitizeGuides(value) {
   const guides = Array.isArray(value) ? value.slice(0, MAX_GUIDES) : [];
   let remaining = MAX_GUIDE_CONTEXT_CHARS;
-  return guides.map((g,index) => {
-    const name = String(g?.name || `Guía ${index + 1}`).slice(0,220);
-    const structure = Array.isArray(g?.structure) ? g.structure.slice(0,250).map(v => String(v).slice(0,500)) : [];
+  return guides.map((g, index) => {
     const original = String(g?.text || '');
-    const fairShare = Math.max(30_000, Math.floor(remaining / Math.max(1, guides.length - index)));
-    const text = original.slice(0, fairShare);
+    const fair = Math.max(20_000, Math.floor(remaining / Math.max(1, guides.length - index)));
+    const text = original.slice(0, fair);
     remaining = Math.max(0, remaining - text.length);
-    return {index,name,structure,text,truncated:text.length < original.length};
+    return {
+      index,
+      name: String(g?.name || `Guía ${index + 1}`).slice(0, 220),
+      structure: Array.isArray(g?.structure) ? g.structure.slice(0, 250).map(v => String(v).slice(0, 500)) : [],
+      text,
+      truncated: text.length < original.length
+    };
   });
 }
 
-function videoPrompt(guides) {
-  const guideContext = guides.length ? JSON.stringify(guides) : '[]';
-  return `MODO AHORRO DE CUOTA: resuelve en ESTA MISMA interacción todo el análisis del video, la selección de guía, la evaluación documental y el primer borrador. No pidas una segunda llamada para estas tareas.
-
-Analiza TODO el video de principio a fin como fuente para documentación operativa. Usa tanto audio/transcripción como contenido visual. Extrae cronológicamente TODAS las acciones observables que realiza la persona, incluso acciones repetidas cuando cambian datos, pantallas o resultados. Cada acción debe ser independiente y utilizable luego como un paso de procedimiento: verbo de acción, sistema o módulo, ruta/pantalla, botón/campo/elemento, dato introducido o seleccionado cuando sea visible, actor si se identifica, validación y resultado. No inventes clics, nombres de botones, datos, rutas ni resultados que no sean observables. Si algo no es legible o inequívoco, conserva la acción pero registra la incertidumbre. Usa marcas de tiempo precisas MM:SS o HH:MM:SS y segundos numéricos.
-
-Para CADA acción identifica el mejor instante para una captura manual: capture_timestamp y capture_seconds deben caer dentro del intervalo de la acción y corresponder al momento donde la pantalla, botón, campo, mensaje o resultado esté más claramente visible. capture_recommended=true solo cuando la imagen aporte evidencia útil (cambio de pantalla, menú, botón importante, formulario, configuración, resultado o confirmación). Usa false para esperas, narración sin cambio visual o acciones repetitivas que no aporten una imagen distinta. capture_reason explica brevemente qué debería verse. NO extraigas, generes ni devuelvas imágenes.
-
-Las GUÍAS INSTITUCIONALES siguientes definen estructura y criterios, NUNCA hechos del proceso. Selecciona la guía aplicable por índice. Conserva literalmente sus títulos y su orden en document_analysis.sections y document_draft.sections. Si una guía aparece marcada como truncated, usa también su campo structure como referencia autoritativa de títulos y no inventes contenido ausente. Solo formula missing_questions para datos críticos realmente imposibles de obtener del video. En document_draft redacta todo lo que sí está sustentado por el video y la guía. NO copies el inventario de acciones en numbered_items: la aplicación insertará localmente todas las ACC con sus timestamps para garantizar cobertura sin otra llamada de IA.
-
-Para ahorrar salida, full_transcript debe ser una narración operativa completa pero compacta (no transcripción palabra por palabra); transcript_segments puede ser una lista breve o vacía. El inventario actions es la fuente exhaustiva del paso a paso. coverage.complete solo puede ser true si revisaste hasta el final real del video. optimization.mode debe ser "single_interaction_video_bundle", model_requests_planned debe ser 1 y notes debe indicar que análisis + borrador se generaron en la misma interacción.
-
-GUÍAS INSTITUCIONALES (índices cero-basados):
-${guideContext}
-
-Devuelve exclusivamente JSON válido conforme al esquema.`;
+async function transcribeRemote(env, mediaUrl, model) {
+  requireServices(env, {deepgram: true});
+  const u = new URL(DEEPGRAM_BASE);
+  u.searchParams.set('model', validateSttModel(model));
+  u.searchParams.set('language', 'es');
+  u.searchParams.set('smart_format', 'true');
+  u.searchParams.set('punctuate', 'true');
+  u.searchParams.set('utterances', 'true');
+  u.searchParams.set('paragraphs', 'true');
+  const response = await fetch(u.toString(), {
+    method: 'POST',
+    headers: {'Authorization': `Token ${env.DEEPGRAM_API_KEY}`, 'Content-Type': 'application/json'},
+    body: JSON.stringify({url: mediaUrl})
+  });
+  return await upstreamJson(response, 'Deepgram');
 }
 
-async function handleVideoStream(request, env, cors) {
+async function extractActions(env, model, chunk, index, total) {
+  const lines = chunk.map(u => `[${secToStamp(u.start)}-${secToStamp(u.end)}] ${u.text}`).join('\n');
+  const prompt = `Extrae TODAS las acciones operativas expresadas en este tramo de una grabación de pantalla. Solo dispones de la TRANSCRIPCIÓN, no de la imagen: no inventes botones, rutas, campos ni resultados que no estén mencionados o sean inequívocos en lo dicho. Mantén acciones repetidas cuando correspondan a datos o momentos distintos. Cada acción debe tener un verbo claro y un intervalo temporal dentro del tramo.\n\nPara capture_seconds usa un segundo dentro del intervalo de la acción que sirva como punto de salto manual en el video. capture_recommended=true cuando conviene que el usuario vaya a ese segundo y tome una captura manual (navegación, clic relevante, diligenciamiento, resultado, confirmación); false para narración general o esperas. capture_reason debe indicar brevemente qué conviene buscar visualmente.\n\nTRAMO ${index + 1}/${total}:\n${lines}\n\nDevuelve exclusivamente JSON.`;
+  return await groqJSON(env, {model, prompt, maxTokens: 32768, schema: ACTION_CHUNK_SCHEMA});
+}
+
+async function buildDocumentBundle(env, model, guides, chunkSummaries, actionStats) {
+  const guideContext = JSON.stringify(guides);
+  const summaries = chunkSummaries.map((s, i) => `TRAMO ${i + 1}: ${s}`).join('\n');
+  const prompt = `Construye el análisis documental y el primer borrador usando las guías institucionales y los resúmenes de una transcripción completa de video.\n\nREGLAS:\n- Las guías definen estructura y criterios; no son evidencia de hechos.\n- Selecciona la guía aplicable por índice cero-basado.\n- Conserva literalmente los títulos y el orden de la guía seleccionada en document_analysis.sections y document_draft.sections.\n- No inventes datos, responsables, rutas, botones o resultados.\n- Solo genera missing_questions cuando falte un dato realmente crítico.\n- En document_draft NO enumeres el paso a paso operativo; la aplicación insertará localmente ${actionStats.count} acciones ACC con timestamps para garantizar cobertura.\n- Usa los resúmenes solo para redactar objetivo, alcance, contexto, responsabilidades u otras secciones sustentadas.\n- Si la guía está truncated, su campo structure es la referencia principal para títulos.\n\nGUÍAS:\n${guideContext}\n\nRESÚMENES CRONOLÓGICOS DEL VIDEO:\n${summaries}\n\nDATOS DE COBERTURA: ${JSON.stringify(actionStats)}\n\nDevuelve exclusivamente JSON con document_analysis y document_draft.`;
+  return await groqJSON(env, {model, prompt, maxTokens: 65536, schema: BUNDLE_SCHEMA});
+}
+
+async function handleVideoAnalyze(request, env) {
+  requireServices(env, {groq: true, deepgram: true});
   const body = await readJson(request);
-  const model = validateModel(body.model || 'gemini-3.8-flash');
   const guides = sanitizeGuides(body.guides);
-  if (!guides.length) throw Object.assign(new Error('El análisis optimizado de video requiere al menos una guía institucional.'), {status:400});
-  const input = [];
-  if (body.youtubeUrl) {
-    const uri = String(body.youtubeUrl).trim();
-    if (!/^https:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(uri)) throw Object.assign(new Error('La URL de YouTube no es válida.'), {status:400});
-    input.push({type:'video', uri, processing:'agentic'});
-  } else {
-    const uri = String(body.uri || '').trim();
-    const mimeType = String(body.mimeType || 'video/mp4').trim();
-    if (!uri) throw Object.assign(new Error('Falta la URI del video subido a Gemini.'), {status:400});
-    input.push({type:'video', uri, mime_type:mimeType, processing:'agentic'});
+  if (!guides.length) throw Object.assign(new Error('Carga al menos una guía institucional.'), {status: 400});
+  const docModel = validateGroqModel(body.model || env.GROQ_MODEL || DEFAULT_DOC_MODEL);
+  const sttModel = validateSttModel(body.transcriptionModel || env.DEEPGRAM_MODEL || DEFAULT_STT_MODEL);
+  let mediaUrl = String(body.remoteUrl || '').trim();
+  let storedKey = String(body.key || '').trim();
+  const storedFileId = String(body.fileId || '').trim();
+  if (storedKey) {
+    requireServices(env, {b2: true});
+    mediaUrl = await signedMediaUrl(request, env, storedKey);
+  } else if (!/^https:\/\//i.test(mediaUrl)) {
+    throw Object.assign(new Error('Falta el video almacenado o una URL HTTPS directa al archivo de video.'), {status: 400});
   }
-  input.push({type:'text', text:videoPrompt(guides)});
 
-  // HOTFIX 2026-10-05: evitamos background:true + GET /interactions/{id}.
-  // Gemini está devolviendo "Multiple authentication credentials received" al recuperar
-  // algunas background interactions aun cuando se envía una sola x-goog-api-key.
-  // Streaming conserva una única interacción/model request y mantiene la conexión viva.
-  const response = await fetch(`${GEMINI_BASE}/v1beta/interactions?alt=sse`, {
-    method:'POST',
-    headers:apiHeaders(env, {'Content-Type':'application/json','Api-Revision':API_REVISION}),
-    body:JSON.stringify({
-      model,
-      input,
-      stream:true,
-      store:false,
-      generation_config:{temperature:0,max_output_tokens:65536},
-      response_format:{type:'text',mime_type:'application/json',schema:VIDEO_SCHEMA}
-    })
+  const dg = await transcribeRemote(env, mediaUrl, sttModel);
+  const transcript = extractDeepgramTranscript(dg);
+  if (!transcript.utterances.length) throw Object.assign(new Error('Deepgram no encontró voz utilizable en el video. Esta V19 documenta a partir de la narración del procedimiento.'), {status: 422});
+
+  const chunks = chunkUtterances(transcript.utterances);
+  const allActions = [];
+  const summaries = [];
+  const uncertainties = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const extracted = await extractActions(env, docModel, chunks[i], i, chunks.length);
+    summaries.push(String(extracted?.summary || '').trim());
+    for (const u of Array.isArray(extracted?.uncertainties) ? extracted.uncertainties : []) if (String(u).trim()) uncertainties.push(String(u).trim());
+    for (const raw of Array.isArray(extracted?.actions) ? extracted.actions : []) {
+      const start = Math.max(0, Number(raw.start_seconds) || 0);
+      const end = Math.max(start, Number(raw.end_seconds) || start);
+      let capture = Number(raw.capture_seconds);
+      if (!Number.isFinite(capture) || capture < start || capture > end) capture = start + (end - start) / 2;
+      const action = String(raw.action || '').trim();
+      if (!action) continue;
+      allActions.push({
+        action,
+        timestamp_start: secToStamp(start),
+        timestamp_end: secToStamp(end),
+        start_seconds: start,
+        end_seconds: end,
+        system: String(raw.system || '').trim(),
+        location_path: String(raw.location_path || '').trim(),
+        interface_element: String(raw.interface_element || '').trim(),
+        result: String(raw.result || '').trim(),
+        uncertainty: String(raw.uncertainty || '').trim(),
+        capture_recommended: raw.capture_recommended !== false,
+        capture_timestamp: secToStamp(capture),
+        capture_seconds: capture,
+        capture_reason: String(raw.capture_reason || 'Ir a este segundo del video para validar visualmente la acción.').trim()
+      });
+    }
+  }
+
+  allActions.sort((a, b) => a.start_seconds - b.start_seconds || a.end_seconds - b.end_seconds);
+  const lastTimestamp = secToStamp(transcript.duration || allActions.at(-1)?.end_seconds || 0);
+  const bundle = await buildDocumentBundle(env, docModel, guides, summaries, {
+    count: allActions.length,
+    duration_seconds: transcript.duration,
+    last_timestamp: lastTimestamp,
+    source: 'Deepgram procesa el archivo completo; Groq extrae acciones desde la transcripción temporal.'
   });
-  if (!response.ok) await upstreamJson(response);
-  const headers = new Headers(cors || {});
-  headers.set('Content-Type', response.headers.get('Content-Type') || 'text/event-stream; charset=utf-8');
-  headers.set('Cache-Control','no-cache, no-transform');
-  headers.set('X-Accel-Buffering','no');
-  return new Response(response.body, {status:200, headers});
+
+  if (storedKey && storedFileId && body.deleteAfter !== false) await deleteB2File(env, storedKey, storedFileId).catch(() => {});
+
+  const compactTranscript = transcript.full.length > 450_000
+    ? transcript.full.slice(0, 450_000) + '\n[Transcripción recortada en la interfaz; el análisis de acciones sí usó todos los tramos.]'
+    : transcript.full;
+
+  return {
+    ok: true,
+    provider: {transcription: 'Deepgram', documentation: 'Groq'},
+    duration_seconds: transcript.duration,
+    duration_estimate: lastTimestamp,
+    detected_language: transcript.detectedLanguage,
+    full_transcript: compactTranscript,
+    transcript_segments: transcript.utterances.slice(0, 250).map(u => ({start: secToStamp(u.start), end: secToStamp(u.end), text: u.text})),
+    actions: allActions,
+    uncertainties,
+    coverage: {
+      complete: true,
+      duration_seconds: transcript.duration,
+      scope: 'Archivo completo enviado a Deepgram. Acciones derivadas de la narración; no se realizó análisis visual automático.',
+      last_timestamp: lastTimestamp
+    },
+    document_analysis: bundle.document_analysis,
+    document_draft: bundle.document_draft,
+    optimization: {
+      mode: 'b2_deepgram_groq_v19_1',
+      transcription_requests: 1,
+      action_chunks: chunks.length,
+      document_requests: chunks.length + 1,
+      notes: 'Sin Gemini. El video se almacena temporalmente en Backblaze B2, Deepgram transcribe con tiempos y Groq redacta.'
+    }
+  };
 }
 
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
     const cors = corsHeaders(origin, env);
-    if (!cors) return new Response('Origin not allowed', {status:403});
-    if (request.method === 'OPTIONS') return new Response(null, {status:204,headers:cors});
     const url = new URL(request.url);
+
+    if (url.pathname === '/media/file' && request.method === 'GET') {
+      try { return await handleMediaFile(request, env); }
+      catch (error) { return new Response(String(error?.message || error), {status: Number(error?.status) || 500}); }
+    }
+
+    if (!cors) return new Response('Origin not allowed', {status: 403});
+    if (request.method === 'OPTIONS') return new Response(null, {status: 204, headers: cors});
+
     try {
       if (url.pathname === '/health' && request.method === 'GET') {
-        return json({ok:true,service:'bot-documental-v18',geminiConfigured:!!env.GEMINI_API_KEY,tokenRequired:!!env.APP_TOKEN},200,cors);
+        return json({
+          ok: true,
+          service: 'bot-documental-v19-1-b2',
+          groqConfigured: !!env.GROQ_API_KEY,
+          deepgramConfigured: !!env.DEEPGRAM_API_KEY,
+          b2Configured: !!(env.B2_APPLICATION_KEY_ID && env.B2_APPLICATION_KEY && env.B2_BUCKET_ID && env.B2_BUCKET_NAME),
+          mediaSigningConfigured: !!(env.MEDIA_SIGNING_SECRET || env.APP_TOKEN),
+          tokenRequired: !!env.APP_TOKEN,
+          docModel: env.GROQ_MODEL || DEFAULT_DOC_MODEL,
+          sttModel: env.DEEPGRAM_MODEL || DEFAULT_STT_MODEL
+        }, 200, cors);
       }
-      if (!authOk(request, env)) return json({ok:false,error:'Token de aplicación inválido.'},401,cors);
-      if (url.pathname === '/chat' && request.method === 'POST') return json(await handleChat(request,env),200,cors);
-      if (url.pathname === '/files/start' && request.method === 'POST') return json(await handleFileStart(request,env),200,cors);
-      if (url.pathname === '/files/chunk' && request.method === 'POST') return json(await handleFileChunk(request),200,cors);
-      if (url.pathname === '/files/query' && request.method === 'POST') return json(await handleFileQuery(request),200,cors);
-      if (url.pathname === '/files/status' && request.method === 'GET') return json(await handleFileStatus(url,env),200,cors);
-      if ((url.pathname === '/video/stream' || url.pathname === '/video/start') && request.method === 'POST') return await handleVideoStream(request,env,cors);
-      return json({ok:false,error:'Ruta no encontrada.'},404,cors);
+      if (!authOk(request, env)) return json({ok: false, error: 'Token de aplicación inválido.'}, 401, cors);
+
+      if (url.pathname === '/chat' && request.method === 'POST') return json(await handleChat(request, env), 200, cors);
+      if (url.pathname === '/media/create' && request.method === 'POST') return json(await handleMediaCreate(request, env), 200, cors);
+      if (url.pathname === '/media/part' && request.method === 'POST') return json(await handleMediaPart(request, env), 200, cors);
+      if (url.pathname === '/media/complete' && request.method === 'POST') return json(await handleMediaComplete(request, env), 200, cors);
+      if (url.pathname === '/media/abort' && request.method === 'POST') return json(await handleMediaAbort(request, env), 200, cors);
+      if (url.pathname === '/video/analyze' && request.method === 'POST') return json(await handleVideoAnalyze(request, env), 200, cors);
+      return json({ok: false, error: 'Ruta no encontrada.'}, 404, cors);
     } catch (error) {
-      const status = Number(error?.status) || 500;
-      return json({ok:false,error:String(error?.message || error),details:error?.body || undefined},status,cors);
+      return json({ok: false, error: String(error?.message || error), details: error?.body || undefined}, Number(error?.status) || 500, cors);
     }
   }
 };

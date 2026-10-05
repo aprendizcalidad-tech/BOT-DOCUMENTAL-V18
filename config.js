@@ -1,8 +1,7 @@
 window.BOT_CONFIG={
-  title:'Bot documental V18.3 · Cloud · streaming · 1 llamada por video',
-  subtitle:'GitHub Pages + Gemini Files API · streaming sin polling · minuto exacto para captura manual',
+  title:'Bot documental V19.1 · Cloud · Backblaze B2',
+  subtitle:'GitHub Pages + Cloudflare Worker + Backblaze B2 + Deepgram + Groq · minuto exacto para captura manual',
   MAX_GUIDES:8,
   MAX_FILE_MB:50,
-  MAX_GEMINI_VIDEO_BYTES:2147483648,
-  VIDEO_UPLOAD_CHUNK_BYTES:16777216
+  VIDEO_UPLOAD_CHUNK_BYTES:33554432
 };

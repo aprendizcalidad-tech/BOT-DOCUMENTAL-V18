@@ -1,81 +1,80 @@
-# BOT DOCUMENTAL V18 CLOUD — inicio rápido
+# BOT DOCUMENTAL V19.1 — BACKBLAZE B2 + DEEPGRAM + GROQ
 
-Esta versión **no necesita instalar Python, FFmpeg, Whisper, Ollama ni ningún servidor en el computador**.
+## Qué hace esta versión
 
-La arquitectura es:
+Esta versión NO usa Gemini y NO usa Cloudflare R2.
 
-1. **GitHub Pages** publica la interfaz web.
-2. **Cloudflare Worker** actúa como backend seguro y guarda la API key de Gemini como secreto.
-3. **Gemini API** analiza documentos y videos.
-4. **Google Drive** es opcional y se conecta por OAuth desde el navegador.
-5. Los videos de archivo/Drive se envían a Gemini por bloques, sin crear una copia en una carpeta local del PC.
-6. Para videos muy grandes se puede usar una **URL pública de YouTube** y Gemini analiza el video directamente.
+Arquitectura:
 
-## Lo único que necesitas
+GitHub Pages → Cloudflare Worker → Backblaze B2 → Deepgram → Groq → Word/PDF en el navegador.
 
-- Una cuenta de GitHub.
-- Una cuenta gratuita de Cloudflare.
-- Una API key de Gemini creada en Google AI Studio.
-- Solo si usarás Drive: un OAuth Client ID de Google para aplicación web.
+- **Backblaze B2** guarda temporalmente el video.
+- **Deepgram Nova-3** transcribe el audio/video completo y conserva timestamps.
+- **Groq GPT-OSS** transforma la transcripción en acciones y prepara el borrador según la guía.
+- El documento NO inserta imágenes automáticamente. Cada acción conserva el minuto/segundo exacto para que hagas la captura manual.
 
-No necesitas ejecutar ningún `.bat`, `.py`, `npm install` ni terminal para ponerlo en producción. Todo se puede configurar desde navegador.
+## Lo que debes crear una sola vez
 
-## Orden recomendado
+1. API Key de Deepgram.
+2. API Key de Groq.
+3. Cuenta Backblaze B2.
+4. Bucket privado de Backblaze B2.
+5. Application Key de Backblaze limitada a ese bucket.
+6. Cloudflare Worker con `worker/worker.js`.
+7. GitHub Pages con el frontend.
 
-1. Sigue `DESPLIEGUE_SIN_INSTALAR.md`.
-2. Publica el contenido de esta carpeta en GitHub Pages.
-3. Abre la página publicada.
-4. Pulsa **Configuración**.
-5. Pega la URL de tu Cloudflare Worker.
-6. Pega el token de aplicación si lo configuraste.
-7. Si usarás Drive, pega tu Google OAuth Client ID.
-8. Pulsa **Comprobar backend**.
+No necesitas Python, Docker, n8n, FFmpeg, Ollama ni Cloudflare R2.
 
-## Límites importantes
+## Datos que debes copiar de Backblaze
 
-- Videos subidos desde el navegador o leídos desde Drive: **hasta 2 GB por archivo en el nivel gratuito de Gemini Files**.
-- Videos mayores de 2 GB: usa la pestaña **YouTube** con una URL pública.
-- Los videos de YouTube directos deben ser públicos.
-- Los archivos temporales subidos a Gemini Files caducan; el bot no los conserva en el PC.
-- La cuota exacta de Gemini depende del proyecto y puede producir `429` si se agota. V18 reduce el número de llamadas de IA frente a V17: una llamada para análisis, una para borrador completo y una para auditoría completa, además del análisis de video.
+Después de crear el bucket y la Application Key necesitarás:
 
-## Qué ya no existe en V18
+- `B2_BUCKET_NAME`: nombre del bucket.
+- `B2_BUCKET_ID`: ID del bucket.
+- `B2_APPLICATION_KEY_ID`: keyID generado por Backblaze.
+- `B2_APPLICATION_KEY`: applicationKey. **Backblaze muestra esta clave completa una sola vez; guárdala.**
 
-- `server.py`
-- `local_ai.py`
-- Ollama
-- Faster-Whisper
-- FFmpeg local
-- carpeta `data/`
-- carpeta de modelos locales
-- `localhost:8765`
+Para la Application Key usa acceso al bucket del Bot Documental con permisos de lectura y escritura. El Worker necesita subir, leer y eliminar los videos temporales.
 
-El frontend sigue generando Word y PDF en el navegador.
+## Variables/secrets del Cloudflare Worker
 
-## Cambio V18.1 — capturas manuales por timestamp
+En Worker → Settings → Variables and Secrets agrega como **Secrets**:
 
-Esta variante ya **no extrae ni incrusta capturas del video**. Durante el análisis de video, Gemini devuelve para cada acción:
+- `GROQ_API_KEY`
+- `DEEPGRAM_API_KEY`
+- `B2_APPLICATION_KEY_ID`
+- `B2_APPLICATION_KEY`
+- `MEDIA_SIGNING_SECRET`
+- `APP_TOKEN` (recomendado)
 
-- intervalo real de la acción (`timestamp_start` / `timestamp_end`),
-- `capture_timestamp`: minuto/segundo exacto recomendado para abrir el video,
-- `capture_seconds`: la misma referencia en segundos,
-- `capture_recommended`: indica si vale la pena tomar una captura,
-- `capture_reason`: qué debería verse en ese instante.
+Agrega como variables normales:
 
-En el borrador y en el Word/PDF cada paso queda, por ejemplo:
+- `B2_BUCKET_ID`
+- `B2_BUCKET_NAME`
+- `GROQ_MODEL` = `openai/gpt-oss-120b`
+- `GROQ_FALLBACK_MODEL` = `openai/gpt-oss-20b`
+- `DEEPGRAM_MODEL` = `nova-3`
+- `ALLOWED_ORIGINS` = URL exacta de tu GitHub Pages
+
+No debes crear ningún binding R2.
+
+## Flujo de uso
+
+1. Carga una o varias guías PDF/DOCX/TXT.
+2. Selecciona un video local o de Google Drive.
+3. Pulsa **Analizar guías y origen**.
+4. El navegador manda el video al Worker en partes.
+5. El Worker almacena esas partes temporalmente en Backblaze B2.
+6. Deepgram transcribe el archivo con tiempos.
+7. Groq extrae las acciones y prepara el borrador.
+8. La aplicación valida las acciones localmente.
+9. Descargas Word/PDF.
+10. El Worker elimina el video temporal de B2 al terminar correctamente.
+
+Ejemplo:
 
 `[ACC-00012] Selecciona Guardar · Video: 00:18:39–00:18:45 · Captura sugerida: 00:18:42`
 
-Así solo tienes que ir al minuto indicado, tomar la captura manualmente y pegarla donde corresponda si la necesitas.
+## Importante
 
-## V18.2 — ahorro de cuota de Gemini
-
-Para un origen de video, el flujo normal ahora es:
-
-1. Subir el video a Files API (carga de archivo).
-2. Ejecutar una sola interacción Gemini que devuelve acciones + timestamps + selección de guía + análisis + borrador.
-3. Editar en el navegador.
-4. Validar cobertura y estructura localmente.
-5. Generar Word/PDF localmente.
-
-No pulses **Regenerar sección** salvo que realmente lo necesites: esa acción sí crea una solicitud adicional de Gemini.
+V19.1 reconstruye las acciones desde la **narración/transcripción**. No analiza automáticamente cada píxel de la pantalla. Si la persona hace clics silenciosos sin explicar lo que hace, esos clics pueden no aparecer.
