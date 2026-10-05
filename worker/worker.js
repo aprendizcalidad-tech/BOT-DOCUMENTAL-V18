@@ -1,5 +1,7 @@
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
 const API_REVISION = '2026-05-20';
+const MAX_GUIDES = 8;
+const MAX_GUIDE_CONTEXT_CHARS = 3_800_000;
 
 function allowedOrigins(env) {
   return String(env.ALLOWED_ORIGINS || '')
@@ -177,6 +179,59 @@ async function handleFileStatus(url, env) {
   return await upstreamJson(response);
 }
 
+const ANALYSIS_SCHEMA = {
+  type:'object',
+  properties:{
+    detected_process:{type:'string'},
+    selected_guide_index:{type:'integer'},
+    selection_reason:{type:'string'},
+    proposed_document_title:{type:'string'},
+    supporting_guide_indices:{type:'array',items:{type:'integer'}},
+    general_requirements:{type:'array',items:{type:'string'}},
+    sections:{type:'array',items:{
+      type:'object',
+      properties:{
+        order:{type:'integer'},title:{type:'string'},guide_instruction:{type:'string'},
+        criteria:{type:'array',items:{type:'string'}},required:{type:'boolean'},status:{type:'string'},
+        evidence:{type:'array',items:{type:'string'}},draft_content:{type:'string'},
+        missing_questions:{
+          type:'array',
+          items:{
+            type:'object',
+            properties:{category:{type:'string'},question:{type:'string'},why_needed:{type:'string'},required:{type:'boolean'}},
+            required:['category','question','why_needed','required']
+          }
+        }
+      },
+      required:['order','title','guide_instruction','criteria','required','status','evidence','draft_content','missing_questions']
+    }},
+    warnings:{type:'array',items:{type:'string'}}
+  },
+  required:['detected_process','selected_guide_index','selection_reason','proposed_document_title','supporting_guide_indices','general_requirements','sections','warnings']
+};
+
+const DOCUMENT_SECTION_SCHEMA = {
+  type:'object',
+  properties:{
+    order:{type:'integer'},title:{type:'string'},
+    paragraphs:{type:'array',items:{type:'string'}},
+    bullets:{type:'array',items:{type:'string'}},
+    numbered_items:{type:'array',items:{type:'string'}},
+    tables:{type:'array',items:{type:'object',properties:{title:{type:'string'},headers:{type:'array',items:{type:'string'}},rows:{type:'array',items:{type:'array',items:{type:'string'}}}},required:['title','headers','rows']}},
+    source_basis:{type:'array',items:{type:'string'}}
+  },
+  required:['order','title','paragraphs','bullets','numbered_items','tables','source_basis']
+};
+
+const DRAFT_SCHEMA = {
+  type:'object',
+  properties:{
+    title:{type:'string'},subtitle:{type:'string'},introductory_note:{type:'string'},
+    sections:{type:'array',items:DOCUMENT_SECTION_SCHEMA},warnings:{type:'array',items:{type:'string'}}
+  },
+  required:['title','subtitle','introductory_note','sections','warnings']
+};
+
 const VIDEO_SCHEMA = {
   type:'object',
   properties:{
@@ -187,18 +242,51 @@ const VIDEO_SCHEMA = {
     transcript_segments:{type:'array',items:{type:'object',properties:{start:{type:'string'},end:{type:'string'},text:{type:'string'}},required:['start','end','text']}},
     actions:{type:'array',items:{type:'object',properties:{action:{type:'string'},timestamp_start:{type:'string'},timestamp_end:{type:'string'},start_seconds:{type:'number'},end_seconds:{type:'number'},system:{type:'string'},location_path:{type:'string'},interface_element:{type:'string'},result:{type:'string'},uncertainty:{type:'string'},capture_recommended:{type:'boolean'},capture_timestamp:{type:'string'},capture_seconds:{type:'number'},capture_reason:{type:'string'}},required:['action','timestamp_start','timestamp_end','start_seconds','end_seconds','system','location_path','interface_element','result','uncertainty','capture_recommended','capture_timestamp','capture_seconds','capture_reason']}},
     uncertainties:{type:'array',items:{type:'string'}},
-    coverage:{type:'object',properties:{complete:{type:'boolean'},duration_seconds:{type:'number'},scope:{type:'string'},last_timestamp:{type:'string'}},required:['complete','duration_seconds','scope','last_timestamp']}
+    coverage:{type:'object',properties:{complete:{type:'boolean'},duration_seconds:{type:'number'},scope:{type:'string'},last_timestamp:{type:'string'}},required:['complete','duration_seconds','scope','last_timestamp']},
+    document_analysis:ANALYSIS_SCHEMA,
+    document_draft:DRAFT_SCHEMA,
+    optimization:{type:'object',properties:{mode:{type:'string'},model_requests_planned:{type:'integer'},notes:{type:'string'}},required:['mode','model_requests_planned','notes']}
   },
-  required:['duration_seconds','duration_estimate','detected_language','full_transcript','actions','uncertainties','coverage']
+  required:['duration_seconds','duration_estimate','detected_language','full_transcript','actions','uncertainties','coverage','document_analysis','document_draft','optimization']
 };
 
-function videoPrompt() {
-  return `Analiza TODO el video de principio a fin como fuente para documentación operativa. Usa tanto audio/transcripción como contenido visual. Extrae cronológicamente TODAS las acciones observables que realiza la persona, incluso acciones repetidas cuando cambian datos, pantallas o resultados. Cada acción debe ser independiente y utilizable luego como un paso de procedimiento: verbo de acción, sistema o módulo, ruta/pantalla, botón/campo/elemento, dato introducido o seleccionado cuando sea visible, actor si se identifica, validación y resultado. No inventes clics, nombres de botones, datos, rutas ni resultados que no sean observables. Si algo no es legible o inequívoco, conserva la acción pero registra la incertidumbre. Usa marcas de tiempo precisas MM:SS o HH:MM:SS y segundos numéricos. Para CADA acción identifica además el mejor instante del video para que una persona haga manualmente una captura: capture_timestamp y capture_seconds deben apuntar al momento dentro del intervalo de la acción donde la pantalla, botón, campo, mensaje o resultado esté más claramente visible. capture_recommended debe ser true cuando una captura aporte evidencia útil (cambio de pantalla, menú, botón importante, formulario, configuración, resultado o confirmación) y false para esperas, narración sin cambio visual o acciones repetitivas que no aporten una imagen distinta. capture_reason debe explicar brevemente qué debería verse en esa captura. NO extraigas, generes ni devuelvas imágenes: solo el momento exacto recomendado. No omitas partes silenciosas que contengan actividad visual. full_transcript debe ser una narración operativa completa y fiel, no una síntesis de pocas líneas. coverage.complete solo puede ser true si revisaste hasta el final real del video. Devuelve exclusivamente JSON válido conforme al esquema.`;
+function sanitizeGuides(value) {
+  const guides = Array.isArray(value) ? value.slice(0, MAX_GUIDES) : [];
+  let remaining = MAX_GUIDE_CONTEXT_CHARS;
+  return guides.map((g,index) => {
+    const name = String(g?.name || `Guía ${index + 1}`).slice(0,220);
+    const structure = Array.isArray(g?.structure) ? g.structure.slice(0,250).map(v => String(v).slice(0,500)) : [];
+    const original = String(g?.text || '');
+    const fairShare = Math.max(30_000, Math.floor(remaining / Math.max(1, guides.length - index)));
+    const text = original.slice(0, fairShare);
+    remaining = Math.max(0, remaining - text.length);
+    return {index,name,structure,text,truncated:text.length < original.length};
+  });
+}
+
+function videoPrompt(guides) {
+  const guideContext = guides.length ? JSON.stringify(guides) : '[]';
+  return `MODO AHORRO DE CUOTA: resuelve en ESTA MISMA interacción todo el análisis del video, la selección de guía, la evaluación documental y el primer borrador. No pidas una segunda llamada para estas tareas.
+
+Analiza TODO el video de principio a fin como fuente para documentación operativa. Usa tanto audio/transcripción como contenido visual. Extrae cronológicamente TODAS las acciones observables que realiza la persona, incluso acciones repetidas cuando cambian datos, pantallas o resultados. Cada acción debe ser independiente y utilizable luego como un paso de procedimiento: verbo de acción, sistema o módulo, ruta/pantalla, botón/campo/elemento, dato introducido o seleccionado cuando sea visible, actor si se identifica, validación y resultado. No inventes clics, nombres de botones, datos, rutas ni resultados que no sean observables. Si algo no es legible o inequívoco, conserva la acción pero registra la incertidumbre. Usa marcas de tiempo precisas MM:SS o HH:MM:SS y segundos numéricos.
+
+Para CADA acción identifica el mejor instante para una captura manual: capture_timestamp y capture_seconds deben caer dentro del intervalo de la acción y corresponder al momento donde la pantalla, botón, campo, mensaje o resultado esté más claramente visible. capture_recommended=true solo cuando la imagen aporte evidencia útil (cambio de pantalla, menú, botón importante, formulario, configuración, resultado o confirmación). Usa false para esperas, narración sin cambio visual o acciones repetitivas que no aporten una imagen distinta. capture_reason explica brevemente qué debería verse. NO extraigas, generes ni devuelvas imágenes.
+
+Las GUÍAS INSTITUCIONALES siguientes definen estructura y criterios, NUNCA hechos del proceso. Selecciona la guía aplicable por índice. Conserva literalmente sus títulos y su orden en document_analysis.sections y document_draft.sections. Si una guía aparece marcada como truncated, usa también su campo structure como referencia autoritativa de títulos y no inventes contenido ausente. Solo formula missing_questions para datos críticos realmente imposibles de obtener del video. En document_draft redacta todo lo que sí está sustentado por el video y la guía. NO copies el inventario de acciones en numbered_items: la aplicación insertará localmente todas las ACC con sus timestamps para garantizar cobertura sin otra llamada de IA.
+
+Para ahorrar salida, full_transcript debe ser una narración operativa completa pero compacta (no transcripción palabra por palabra); transcript_segments puede ser una lista breve o vacía. El inventario actions es la fuente exhaustiva del paso a paso. coverage.complete solo puede ser true si revisaste hasta el final real del video. optimization.mode debe ser "single_interaction_video_bundle", model_requests_planned debe ser 1 y notes debe indicar que análisis + borrador se generaron en la misma interacción.
+
+GUÍAS INSTITUCIONALES (índices cero-basados):
+${guideContext}
+
+Devuelve exclusivamente JSON válido conforme al esquema.`;
 }
 
 async function handleVideoStart(request, env) {
   const body = await readJson(request);
   const model = validateModel(body.model || 'gemini-3.7-flash');
+  const guides = sanitizeGuides(body.guides);
+  if (!guides.length) throw Object.assign(new Error('El análisis optimizado de video requiere al menos una guía institucional.'), {status:400});
   const input = [];
   if (body.youtubeUrl) {
     const uri = String(body.youtubeUrl).trim();
@@ -210,7 +298,7 @@ async function handleVideoStart(request, env) {
     if (!uri) throw Object.assign(new Error('Falta la URI del video subido a Gemini.'), {status:400});
     input.push({type:'video', uri, mime_type:mimeType, processing:'agentic'});
   }
-  input.push({type:'text', text:videoPrompt()});
+  input.push({type:'text', text:videoPrompt(guides)});
   const response = await fetch(`${GEMINI_BASE}/v1beta/interactions`, {
     method:'POST',
     headers:apiHeaders(env, {'Content-Type':'application/json','Api-Revision':API_REVISION}),

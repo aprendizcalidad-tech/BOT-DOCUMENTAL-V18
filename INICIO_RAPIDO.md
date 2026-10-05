@@ -67,3 +67,15 @@ En el borrador y en el Word/PDF cada paso queda, por ejemplo:
 `[ACC-00012] Selecciona Guardar · Video: 00:18:39–00:18:45 · Captura sugerida: 00:18:42`
 
 Así solo tienes que ir al minuto indicado, tomar la captura manualmente y pegarla donde corresponda si la necesitas.
+
+## V18.2 — ahorro de cuota de Gemini
+
+Para un origen de video, el flujo normal ahora es:
+
+1. Subir el video a Files API (carga de archivo).
+2. Ejecutar una sola interacción Gemini que devuelve acciones + timestamps + selección de guía + análisis + borrador.
+3. Editar en el navegador.
+4. Validar cobertura y estructura localmente.
+5. Generar Word/PDF localmente.
+
+No pulses **Regenerar sección** salvo que realmente lo necesites: esa acción sí crea una solicitud adicional de Gemini.

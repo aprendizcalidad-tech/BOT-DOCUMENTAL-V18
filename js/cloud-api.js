@@ -47,6 +47,12 @@ async function request(path, options = {}, retries = 4) {
       });
       if (response.ok) return response;
       const message = await parseError(response);
+      const dailyQuota = response.status === 429 && /per day|requests per day|\bRPD\b|free tier|retry in\s+\d+/i.test(message);
+      if (dailyQuota) {
+        const error = new Error(message + ' · La aplicación no repetirá esta solicitud automáticamente para no gastar intentos innecesarios.');
+        error.noRetry = true;
+        throw error;
+      }
       if (![429, 500, 502, 503, 504].includes(response.status) || attempt === retries) {
         const error = new Error(message);
         error.noRetry = true;

@@ -164,3 +164,9 @@ Antes de usar un video de varias horas:
 V18.1 elimina la extracción automática de frames. Gemini analiza la evidencia visual del video, pero devuelve únicamente marcas de tiempo. Para cada acción importante identifica el instante más claro para una captura manual. El Word/PDF conserva esa referencia junto al paso.
 
 Después de actualizar el frontend también debes volver a desplegar `worker/worker.js`, porque el esquema de análisis de video ahora incluye `capture_timestamp`, `capture_seconds`, `capture_recommended` y `capture_reason`.
+
+## L. Modo cuota optimizada (V18.2)
+
+Después de actualizar GitHub Pages también debes volver a desplegar `worker/worker.js`. El Worker V18.2 recibe el texto de las guías junto con la referencia del video y pide a Gemini una salida estructurada única que contiene inventario de acciones, timestamps, selección de guía, análisis y borrador. El navegador reutiliza esa salida y ejecuta la auditoría final localmente.
+
+La optimización reduce las llamadas de inferencia, pero no modifica las cuotas de Google. Si el proyecto ya agotó su RPD, debes esperar el restablecimiento indicado por Gemini o usar un nivel de cuota distinto.

@@ -4,7 +4,7 @@ import {attachActions,assertCoverage,assertCaptureReferences,captureReference} f
 import {$,$$,bytes,ext,isVideoName,safeName,downloadBlob,jsonBlob,debounce,esc} from './utils.js';
 import {idbGet,idbSet,idbClear} from './storage.js';
 import {buildRecord,extractGuideStructure} from './file-reader.js';
-import {analyzeLocal,generateDraftLocal,regenerateSection,auditLocal,renderTranscriptAsSource,normalizeFinal} from './local-ai.js';
+import {analyzeLocal,generateDraftLocal,regenerateSection,auditLocal,renderTranscriptAsSource,normalizeFinal,normalizeBundledAnalysis,bundledDraft,applyAnswersLocally,auditVideoDeterministic} from './local-ai.js';
 import {connectDrive,isDriveConnected,downloadDriveFile} from './drive.js';
 import {createDocx,createPdf} from './documents.js';
 import {setCloudConfig,cloudJSON} from './cloud-api.js';
@@ -38,11 +38,11 @@ function renderFiles(){
 }
 
 async function prepareGuides(){const out=[];for(let i=0;i<state.guideFiles.length;i++){setProgress(.05+.22*(i/state.guideFiles.length),`Leyendo guía ${i+1}/${state.guideFiles.length}: ${state.guideFiles[i].name}`);const r=await buildRecord(state.guideFiles[i],'guide');r.structure=extractGuideStructure(r.text);out.push(r)}state.guides=out;return out}
-async function prepareSource(){
+async function prepareSource(guides=[]){
  let file=state.sourceFile, ref='';
  if(state.sourceMode==='youtube'){
   const youtubeUrl=$('#youtubeReference').value.trim();if(!youtubeUrl)throw new Error('Pega una URL pública de YouTube.');
-  const result=await processVideo({youtubeUrl,model:settings.videoModel,onProgress:(m,p)=>setProgress(.28+.28*p,m)});
+  const result=await processVideo({youtubeUrl,model:settings.videoModel,guides,onProgress:(m,p)=>setProgress(.28+.28*p,m)});
   state.engineJob=result.jobId;state.videoFile=null;state.videoTranscript=result.transcript;
   state.sourceRecord={name:result.name,kind:'video',fingerprint:result.fingerprint,text:renderTranscriptAsSource(result.transcript,result.name),video_actions:result.transcript.actions};
   return state.sourceRecord;
@@ -54,7 +54,7 @@ async function prepareSource(){
  }
  if(ref||file&&(isVideoName(file.name)||file.type.startsWith('video/'))){
   const report=(m,p)=>setProgress(.28+.28*p,m);
-  const result=await processVideo({file:ref?null:file,driveReference:ref||undefined,model:settings.videoModel,onProgress:report});
+  const result=await processVideo({file:ref?null:file,driveReference:ref||undefined,model:settings.videoModel,guides,onProgress:report});
   state.engineJob=result.jobId;state.videoFile=ref?null:file;state.videoTranscript=result.transcript;
   if(!result.transcript.actions.length)toast('Gemini no identificó acciones operativas en el video. Revisa que el contenido sea visible y narrado.','bad',10000);
   state.sourceRecord={name:result.name,kind:'video',fingerprint:result.fingerprint,text:renderTranscriptAsSource(result.transcript,result.name),video_actions:result.transcript.actions};
@@ -66,7 +66,15 @@ async function prepareSource(){
 }
 
 async function analyze(){try{ensureApi();if(!state.guideFiles.length)throw new Error('Carga al menos una guía.');if(state.guideFiles.length>(base.MAX_GUIDES||8))throw new Error(`Máximo ${base.MAX_GUIDES||8} guías.`);if(state.sourceMode==='local'&&!state.sourceFile)throw new Error('Carga el documento o video de origen.');if(state.sourceMode==='drive'&&!$('#driveReference').value.trim())throw new Error('Pega la URL del archivo de Drive.');if(state.sourceMode==='youtube'&&!$('#youtubeReference').value.trim())throw new Error('Pega una URL pública de YouTube.');
-  progressStart('Analizando guías y origen');setProgress(.03,'Validando archivos…');const guides=await prepareGuides();const source=await prepareSource();setProgress(.58,'Seleccionando la guía aplicable y comparando evidencia…');const analysis=await analyzeLocal({model:settings.model,guides,source});state.analysis=analysis;state.answers=[];state.finalDocument=null;state.audit=null;state.docxBlob=null;state.pdfBlob=null;await saveSnapshot();renderAnalysis();setStep(2);show('#stageAnalysis',true);$('#stageAnalysis').scrollIntoView({behavior:'smooth'});progressEnd();toast('Análisis completado.')
+  progressStart('Analizando guías y origen');setProgress(.03,'Validando archivos…');const guides=await prepareGuides();const source=await prepareSource(guides);let analysis;
+  if(state.videoTranscript?.document_analysis){
+    setProgress(.58,'Recuperando selección de guía y estructura de la misma interacción del video…');
+    analysis=normalizeBundledAnalysis(state.videoTranscript.document_analysis,guides);
+  }else{
+    setProgress(.58,'Seleccionando la guía aplicable y comparando evidencia…');
+    analysis=await analyzeLocal({model:settings.model,guides,source});
+  }
+  state.analysis=analysis;state.answers=[];state.finalDocument=null;state.audit=null;state.docxBlob=null;state.pdfBlob=null;await saveSnapshot();renderAnalysis();setStep(2);show('#stageAnalysis',true);$('#stageAnalysis').scrollIntoView({behavior:'smooth'});progressEnd();toast(state.videoTranscript?'Análisis completado con una sola interacción de Gemini.':'Análisis completado.')
 }catch(e){fail(e)}}
 
 function renderAnalysis(){const a=state.analysis;if(!a)return;$('#actionSection').innerHTML=(a.sections||[]).map(s=>`<option value="${s.order}">${esc(s.title)}</option>`).join('');const procedural=(a.sections||[]).find(s=>/procedimiento|desarrollo|paso|actividad|descripción/i.test(s.title));if(procedural)$('#actionSection').value=procedural.order;show('#actionSectionBox',!!state.videoTranscript);const req=(a.sections||[]).filter(s=>s.required).length,missing=(a.sections||[]).filter(s=>s.status==='faltante').length,partial=(a.sections||[]).filter(s=>s.status==='parcial').length;
@@ -79,7 +87,16 @@ function renderAnalysis(){const a=state.analysis;if(!a)return;$('#actionSection'
 function metric(k,v){return `<div class="metric"><span>${esc(k)}</span><b>${esc(v||'—')}</b></div>`}
 function collectAnswers(){return $$('.question-answer').map(x=>({section_title:x.dataset.section,question:x.dataset.question,answer:x.value.trim()})).filter(x=>x.answer)}
 
-async function generateDraft(){try{ensureApi();if(!state.analysis)throw new Error('Primero analiza los archivos.');state.answers=collectAnswers();progressStart('Generando borrador');setProgress(.12,'Preparando análisis, respuestas y estructura exacta…');setProgress(.3,'Redactando secciones con trazabilidad…');const doc=await generateDraftLocal({model:settings.model,guides:state.guides,source:state.sourceRecord,analysis:state.analysis,answers:state.answers,onProgress:m=>setProgress(.4,m)});if(state.videoTranscript)attachActions(doc,state.videoTranscript.actions,Number($('#actionSection').value));state.finalDocument=doc;await saveSnapshot();renderDraft();setStep(3);show('#stageDraft',true);$('#stageDraft').scrollIntoView({behavior:'smooth'});progressEnd();toast('Borrador generado.') }catch(e){fail(e)}}
+async function generateDraft(){try{ensureApi();if(!state.analysis)throw new Error('Primero analiza los archivos.');state.answers=collectAnswers();progressStart('Generando borrador');setProgress(.12,'Preparando análisis, respuestas y estructura exacta…');let doc;
+  if(state.videoTranscript?.document_draft){
+    setProgress(.3,'Usando el borrador ya generado dentro de la interacción única del video…');
+    doc=bundledDraft(state.videoTranscript.document_draft,state.analysis);
+    doc=applyAnswersLocally(doc,state.answers);
+  }else{
+    setProgress(.3,'Redactando secciones con trazabilidad…');
+    doc=await generateDraftLocal({model:settings.model,guides:state.guides,source:state.sourceRecord,analysis:state.analysis,answers:state.answers,onProgress:m=>setProgress(.4,m)});
+  }
+  if(state.videoTranscript)attachActions(doc,state.videoTranscript.actions,Number($('#actionSection').value));state.finalDocument=doc;await saveSnapshot();renderDraft();setStep(3);show('#stageDraft',true);$('#stageDraft').scrollIntoView({behavior:'smooth'});progressEnd();toast(state.videoTranscript?'Borrador generado sin consumir otra solicitud de Gemini.':'Borrador generado.') }catch(e){fail(e)}}
 
 function joinLines(a){return (a||[]).join('\n')}
 function renderDraft(){const d=state.finalDocument;if(!d)return;$('#docTitle').value=d.title||'';$('#docSubtitle').value=d.subtitle||'';$('#docIntro').value=d.introductory_note||'';const host=$('#draftSections');host.innerHTML='';(d.sections||[]).forEach((s,i)=>{const el=document.createElement('div');el.className='draft-section';el.dataset.order=s.order;el.innerHTML=`<div class="section-toolbar"><h3>${s.order}. ${esc(s.title)}</h3><button class="btn secondary small regen-section" data-order="${s.order}">✨ Regenerar sección</button></div><div class="draft-grid"><label class="full">Párrafos<textarea class="textarea f-paragraphs" rows="5">${esc(joinLines(s.paragraphs))}</textarea></label><label>Pasos numerados<textarea class="textarea f-numbered" rows="6">${esc(joinLines(s.numbered_items))}</textarea></label><label>Viñetas<textarea class="textarea f-bullets" rows="6">${esc(joinLines(s.bullets))}</textarea></label><label class="full">Tablas (JSON)<textarea class="textarea table-editor f-tables" rows="5">${esc(JSON.stringify(s.tables||[],null,2))}</textarea></label><label class="full">Sustento<textarea class="textarea f-basis" rows="2">${esc(joinLines(s.source_basis))}</textarea></label></div>`;host.appendChild(el)});wireDraftAutosave()}
@@ -89,7 +106,15 @@ const saveDraftDebounced=debounce(async()=>{if(!state.finalDocument)return;state
 function wireDraftAutosave(){$$('#stageDraft textarea, #stageDraft input').forEach(x=>x.addEventListener('input',saveDraftDebounced));$$('.regen-section').forEach(b=>b.addEventListener('click',()=>regenOne(Number(b.dataset.order),b)))}
 async function regenOne(order,button){try{ensureApi();state.finalDocument=readDraftFromDom();button.disabled=true;button.textContent='Regenerando…';const sec=await regenerateSection({model:settings.model,guides:state.guides,source:state.sourceRecord,analysis:state.analysis,answers:state.answers,document:state.finalDocument,sectionOrder:order});state.finalDocument.sections=state.finalDocument.sections.map(s=>Number(s.order)===order?sec:s);renderDraft();await saveSnapshot();toast('Sección regenerada.')}catch(e){fail(e)}finally{if(button){button.disabled=false;button.textContent='✨ Regenerar sección'}}}
 
-async function finalize(){try{ensureApi();state.finalDocument=readDraftFromDom();progressStart('Auditando y preparando documento final');setProgress(.14,'Guardando tus modificaciones…');setProgress(.30,'Auditando el documento completo contra la guía…');const audit=await auditLocal({model:settings.model,guides:state.guides,source:state.sourceRecord,analysis:state.analysis,document:state.finalDocument});state.audit=audit;state.finalDocument.validation=audit.validation||state.finalDocument.validation;state.finalDocument.warnings=[...new Set([...(state.finalDocument.warnings||[]),...(audit.warnings||[])])];await buildOutputs();}catch(e){fail(e)}}
+async function finalize(){try{ensureApi();state.finalDocument=readDraftFromDom();progressStart('Auditando y preparando documento final');setProgress(.14,'Guardando tus modificaciones…');let audit;
+  if(state.videoTranscript){
+    setProgress(.30,'Ejecutando auditoría local de estructura, cobertura y timestamps…');
+    audit=auditVideoDeterministic({analysis:state.analysis,document:state.finalDocument,answers:state.answers,coverage:state.videoTranscript.coverage});
+  }else{
+    setProgress(.30,'Auditando el documento completo contra la guía…');
+    audit=await auditLocal({model:settings.model,guides:state.guides,source:state.sourceRecord,analysis:state.analysis,document:state.finalDocument});
+  }
+  state.audit=audit;state.finalDocument.validation=audit.validation||state.finalDocument.validation;state.finalDocument.warnings=[...new Set([...(state.finalDocument.warnings||[]),...(audit.warnings||[])])];await buildOutputs();}catch(e){fail(e)}}
 
 async function buildOutputs(){if(state.videoTranscript){assertCoverage(state.finalDocument,state.videoTranscript.actions);assertCaptureReferences(state.finalDocument,state.videoTranscript.actions);}progressStart('Generando Word y PDF');setProgress(.86,'Aplicando formato institucional y referencias de video…');const guide=state.guides[state.analysis.selected_guide_index];const template=guide?.extension==='docx'?guide.file:null;state.docxBlob=await createDocx(state.finalDocument,{templateFile:template});setProgress(.93,'Creando PDF paginado…');try{state.pdfBlob=await createPdf(state.finalDocument)}catch(e){state.pdfBlob=null;state.finalDocument.warnings.push('PDF no disponible: '+e.message);}await saveSnapshot();renderFinal();setStep(4);show('#stageFinal',true);$('#stageFinal').scrollIntoView({behavior:'smooth'});progressEnd();toast('Documento final generado con minutos exactos para capturas manuales.');}
 

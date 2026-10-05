@@ -15,7 +15,7 @@
 
   <header class="topbar">
     <div>
-      <div class="eyebrow">BOT DOCUMENTAL · V18.1 CLOUD</div>
+      <div class="eyebrow">BOT DOCUMENTAL · V18.2 CLOUD · CUOTA OPTIMIZADA</div>
       <h1 id="appTitle">Generador documental inteligente</h1>
       <p id="appSubtitle" class="muted"></p>
     </div>
@@ -30,15 +30,15 @@
     <section class="hero panel">
       <div>
         <h2>De una guía y un origen a un documento institucional</h2>
-        <p>Interpreta hasta 8 guías, analiza PDF/DOCX/TXT o video, genera el paso a paso y marca el minuto/segundo exacto donde conviene tomar cada captura manual. No extrae imágenes automáticamente. La IA y el video se procesan en la nube; no requiere Python, Ollama, Whisper ni FFmpeg en el computador.</p>
+        <p>Interpreta hasta 8 guías y, cuando el origen es video, resuelve análisis, selección de guía, acciones, timestamps y borrador base en una sola interacción de Gemini. La auditoría final del video se hace localmente para no gastar solicitudes adicionales. No extrae imágenes automáticamente.</p>
       </div>
       <div id="apiStatus" class="status-chip warn">Configura backend cloud</div>
     </section>
 
-    <section class="panel"><h3>Motor cloud</h3><p id="localDiagnostics">Configura la URL del Worker y comprueba la conexión.</p><div class="action-row"><button id="btnDiagnostics" class="btn secondary">Comprobar backend</button></div><div class="callout subtle">La clave de Gemini permanece como secreto en el backend. GitHub Pages nunca recibe la API key.</div></section>
+    <section class="panel"><h3>Motor cloud</h3><p id="localDiagnostics">Configura la URL del Worker y comprueba la conexión.</p><div class="action-row"><button id="btnDiagnostics" class="btn secondary">Comprobar backend</button></div><div class="callout subtle">La clave de Gemini permanece como secreto en el backend. En video, el flujo normal usa 1 interacción de modelo; subir el archivo y consultar su estado no son llamadas de generación.</div></section>
     <section class="steps" aria-label="Flujo">
       <div class="step active" data-step="1"><span>1</span><b>Cargar</b><small>Guías y origen</small></div>
-      <div class="step" data-step="2"><span>2</span><b>Analizar</b><small>IA cloud + trazabilidad</small></div>
+      <div class="step" data-step="2"><span>2</span><b>Analizar</b><small>1 interacción + trazabilidad</small></div>
       <div class="step" data-step="3"><span>3</span><b>Completar</b><small>Brechas y borrador</small></div>
       <div class="step" data-step="4"><span>4</span><b>Generar</b><small>Word + PDF</small></div>
     </section>
@@ -140,7 +140,7 @@
       <div id="draftSections" class="stack"></div>
       <div class="action-row split">
         <button id="btnBackAnalysis" class="btn ghost">← Volver al análisis</button>
-        <button id="btnFinalize" class="btn primary large">✅ Auditar y generar Word + PDF</button>
+        <button id="btnFinalize" class="btn primary large">✅ Validar localmente y generar Word + PDF</button>
       </div>
     </section>
 

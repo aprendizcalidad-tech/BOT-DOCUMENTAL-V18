@@ -76,6 +76,102 @@ export async function auditLocal({model,guides,source,analysis,document}){
   return {validation:normalizeArray(out.validation),warnings:normalizeArray(out.warnings),editorial_summary:ensureText(out.editorial_summary)||'Auditoría documental completada con Gemini.'};
 }
 
+export function normalizeBundledAnalysis(raw,guides=[]){
+  const out=raw&&typeof raw==='object'?structuredClone(raw):{};
+  const idx=Number(out.selected_guide_index);
+  if(!Number.isInteger(idx)||!guides[idx])throw new Error('La interacción única no seleccionó una guía válida.');
+  out.selected_guide_index=idx;
+  out.selected_guide_name=guides[idx].name;
+  out.detected_process=ensureText(out.detected_process)||'Proceso identificado en video';
+  out.selection_reason=ensureText(out.selection_reason);
+  out.proposed_document_title=ensureText(out.proposed_document_title)||'Documento generado desde video';
+  out.supporting_guide_indices=normalizeArray(out.supporting_guide_indices).map(Number).filter(Number.isInteger);
+  out.general_requirements=normalizeArray(out.general_requirements).map(ensureText).filter(Boolean);
+  out.sections=normalizeArray(out.sections).map((s,i)=>({
+    order:Number(s?.order)||i+1,
+    title:ensureText(s?.title),
+    guide_instruction:ensureText(s?.guide_instruction),
+    criteria:normalizeArray(s?.criteria).map(ensureText).filter(Boolean),
+    required:s?.required!==false,
+    status:['completo','parcial','faltante'].includes(String(s?.status))?String(s.status):'parcial',
+    evidence:normalizeArray(s?.evidence).map(ensureText).filter(Boolean),
+    draft_content:ensureText(s?.draft_content),
+    missing_questions:normalizeArray(s?.missing_questions).map(q=>({
+      category:ensureText(q?.category)||'Información del proceso',
+      question:ensureText(q?.question),
+      why_needed:ensureText(q?.why_needed),
+      required:q?.required!==false
+    })).filter(q=>q.question)
+  })).filter(s=>s.title);
+  if(!out.sections.length)throw new Error('La interacción única no devolvió la estructura documental.');
+  out.warnings=normalizeArray(out.warnings).map(ensureText).filter(Boolean);
+  out.warnings.push('Modo ahorro de cuota: análisis del video, selección de guía y borrador base se generaron en una sola interacción de Gemini.');
+  return out;
+}
+
+export function bundledDraft(raw,analysis){
+  const base=normalizeFinal(raw||{});
+  const generated=base.sections||[];
+  const sections=(analysis?.sections||[]).map((expected,i)=>{
+    const found=generated.find(s=>Number(s.order)===Number(expected.order))||generated[i]||{};
+    return normalizeSection({...found,order:expected.order,title:expected.title});
+  });
+  return normalizeFinal({
+    title:base.title||analysis?.proposed_document_title,
+    subtitle:base.subtitle,
+    introductory_note:base.introductory_note,
+    sections,
+    warnings:[...(base.warnings||[]),'Borrador base generado junto con el análisis de video para evitar una segunda llamada a Gemini.']
+  });
+}
+
+export function applyAnswersLocally(document,answers=[]){
+  const out=normalizeFinal(structuredClone(document||{}));
+  let applied=0;
+  for(const item of normalizeArray(answers)){
+    const answer=ensureText(item?.answer);if(!answer)continue;
+    const target=out.sections.find(s=>s.title===item.section_title)||out.sections.find(s=>String(s.title).toLowerCase()===String(item.section_title||'').toLowerCase());
+    if(!target)continue;
+    const question=ensureText(item?.question);
+    const sentence=question?`Información complementaria aportada por el usuario — ${question}: ${answer}`:`Información complementaria aportada por el usuario: ${answer}`;
+    if(!target.paragraphs.includes(sentence))target.paragraphs.push(sentence);
+    applied++;
+  }
+  if(applied)out.warnings.push(`${applied} respuesta(s) del usuario se incorporaron localmente al borrador para no consumir otra solicitud de IA. Puedes ajustar su redacción en el editor antes de generar.`);
+  return out;
+}
+
+export function auditVideoDeterministic({analysis,document,answers=[],coverage={}}){
+  const answerKeys=new Set(normalizeArray(answers).filter(a=>ensureText(a?.answer)).map(a=>`${a.section_title}::${a.question}`));
+  const validation=[];
+  const warnings=[];
+  for(const expected of analysis?.sections||[]){
+    const section=(document?.sections||[]).find(s=>Number(s.order)===Number(expected.order));
+    const hasContent=!!section&&[
+      ...(section.paragraphs||[]),...(section.bullets||[]),...(section.numbered_items||[]),...(section.tables||[])
+    ].length>0;
+    const unanswered=(expected.missing_questions||[]).filter(q=>q.required!==false&&!answerKeys.has(`${expected.title}::${q.question}`));
+    const titleOk=!!section&&String(section.title||'').trim()===String(expected.title||'').trim();
+    const status=hasContent&&titleOk&&!unanswered.length?'cumple':'parcial';
+    const criteria=(expected.criteria||[]).length?expected.criteria:['Sección presente, titulada correctamente y con contenido sustentado'];
+    for(const criterion of criteria){
+      validation.push({
+        section_title:expected.title,
+        criterion,
+        status,
+        note:!section?'La sección no está presente en el borrador.':!titleOk?'El título u orden no coincide con la guía seleccionada.':!hasContent?'La sección no contiene información.':unanswered.length?`Faltan ${unanswered.length} dato(s) crítico(s) marcado(s) como requerido(s).`:'Validación estructural local superada.'
+      });
+    }
+  }
+  if(coverage?.complete!==true)warnings.push('Gemini no confirmó que hubiera revisado el final real del video; verifica la cobertura antes de aprobar el documento.');
+  const partial=validation.filter(v=>v.status==='parcial').length;
+  return {
+    validation,
+    warnings,
+    editorial_summary:partial?`Auditoría local completada sin llamadas adicionales a Gemini: ${partial} criterio(s) requieren revisión.`:'Auditoría local completada sin llamadas adicionales a Gemini. La estructura, los datos críticos respondidos y la trazabilidad temporal superaron las validaciones disponibles.'
+  };
+}
+
 function normalizeSection(s={}){
   return {order:Number(s.order)||1,title:ensureText(s.title),paragraphs:normalizeArray(s.paragraphs).map(ensureText),bullets:normalizeArray(s.bullets).map(ensureText),numbered_items:normalizeArray(s.numbered_items).map(ensureText),tables:normalizeArray(s.tables).map(t=>({title:ensureText(t.title),headers:normalizeArray(t.headers).map(ensureText),rows:normalizeArray(t.rows).map(r=>normalizeArray(r).map(ensureText))})),source_basis:normalizeArray(s.source_basis).map(ensureText)};
 }

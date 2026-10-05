@@ -16,7 +16,7 @@ test('Worker crea análisis agentic de YouTube en background',async()=>{
  const original=globalThis.fetch;let captured;
  globalThis.fetch=async(url,opts)=>{captured={url:String(url),opts,body:JSON.parse(opts.body)};return new Response(JSON.stringify({id:'v1_prueba',status:'in_progress'}),{status:200,headers:{'Content-Type':'application/json'}})};
  try{
-  const request=new Request('https://worker.example/video/start',{method:'POST',headers:{Origin:'https://usuario.github.io','X-App-Token':'app-secret','Content-Type':'application/json'},body:JSON.stringify({youtubeUrl:'https://www.youtube.com/watch?v=abc123',model:'gemini-3.7-flash'})});
+  const request=new Request('https://worker.example/video/start',{method:'POST',headers:{Origin:'https://usuario.github.io','X-App-Token':'app-secret','Content-Type':'application/json'},body:JSON.stringify({youtubeUrl:'https://www.youtube.com/watch?v=abc123',model:'gemini-3.7-flash',guides:[{name:'Procedimiento institucional.docx',structure:['Objetivo','Alcance','Procedimiento'],text:'Objetivo\nAlcance\nProcedimiento'}]})});
   const response=await worker.fetch(request,env);const data=await response.json();
   assert.equal(response.status,200);assert.equal(data.id,'v1_prueba');
   assert.equal(captured.body.background,true);
@@ -25,7 +25,11 @@ test('Worker crea análisis agentic de YouTube en background',async()=>{
   assert.equal(captured.body.response_format.mime_type,'application/json');
   const actionProps=captured.body.response_format.schema.properties.actions.items.properties;
   assert.ok(actionProps.capture_timestamp);assert.ok(actionProps.capture_seconds);assert.ok(actionProps.capture_recommended);assert.ok(actionProps.capture_reason);
+  assert.ok(captured.body.response_format.schema.properties.document_analysis);
+  assert.ok(captured.body.response_format.schema.properties.document_draft);
   assert.match(captured.body.input[1].text,/NO extraigas, generes ni devuelvas imágenes/i);
+  assert.match(captured.body.input[1].text,/MODO AHORRO DE CUOTA/i);
+  assert.match(captured.body.input[1].text,/Procedimiento institucional\.docx/i);
   assert.equal(new Headers(captured.opts.headers).get('x-goog-api-key'),'secret-key');
  }finally{globalThis.fetch=original;}
 });

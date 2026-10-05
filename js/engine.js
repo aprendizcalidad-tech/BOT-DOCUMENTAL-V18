@@ -5,6 +5,7 @@ import {cloudJSON,cloudRaw} from './cloud-api.js';
 const MAX_FILE_BYTES=2*1024*1024*1024;
 const CHUNK_BYTES=16*1024*1024;
 const ACTIVE_KEY='bot-v18-active-video';
+const MAX_GUIDE_CONTEXT_CHARS=3_600_000;
 
 function activeJobFor(fingerprint){
   try{
@@ -17,6 +18,23 @@ function clearActive(jobId){try{const v=JSON.parse(sessionStorage.getItem(ACTIVE
 
 function fileObject(value){return value?.file || value || {};}
 function stateName(value){return String(fileObject(value)?.state || '').toUpperCase();}
+
+export function buildGuidePayload(guides=[]){
+  const input=Array.isArray(guides)?guides.slice(0,8):[];
+  let remaining=MAX_GUIDE_CONTEXT_CHARS;
+  return input.map((g,index)=>{
+    const original=String(g?.text||'');
+    const fair=Math.max(30_000,Math.floor(remaining/Math.max(1,input.length-index)));
+    const text=original.slice(0,fair);
+    remaining=Math.max(0,remaining-text.length);
+    return {
+      name:String(g?.name||`Guía ${index+1}`).slice(0,220),
+      structure:Array.isArray(g?.structure)?g.structure.slice(0,250).map(String):[],
+      text,
+      truncated:text.length<original.length
+    };
+  });
+}
 
 async function fingerprintMeta(meta){
   return await sha256Blob(jsonBlob(meta));
@@ -153,8 +171,11 @@ function normalizeTranscript(raw){
   return t;
 }
 
-async function startInteraction({uri,mimeType,youtubeUrl,model}){
-  return await cloudJSON('/video/start',youtubeUrl?{youtubeUrl,model}:{uri,mimeType,model},{retries:3});
+async function startInteraction({uri,mimeType,youtubeUrl,model,guides}){
+  const payload={model,guides:buildGuidePayload(guides)};
+  if(youtubeUrl)payload.youtubeUrl=youtubeUrl;
+  else Object.assign(payload,{uri,mimeType});
+  return await cloudJSON('/video/start',payload,{retries:1});
 }
 
 export async function awaitJob(id,onProgress=()=>{}){
@@ -180,17 +201,19 @@ export async function awaitJob(id,onProgress=()=>{}){
   throw new Error('El análisis de video no terminó dentro de la sesión actual.');
 }
 
-export async function processVideo({file,driveReference,youtubeUrl,model,onProgress=()=>{}}){
+export async function processVideo({file,driveReference,youtubeUrl,model,guides=[],onProgress=()=>{}}){
   let name='video';
   let fingerprint='';
   let uri='';
   let mimeType='video/mp4';
+  if(!Array.isArray(guides)||!guides.length)throw new Error('El modo de video optimizado necesita al menos una guía institucional.');
+  const guideFingerprint=await fingerprintMeta(buildGuidePayload(guides).map(g=>({name:g.name,structure:g.structure,text:g.text,truncated:g.truncated})));
 
   if(youtubeUrl){
     const url=String(youtubeUrl).trim();
     if(!url)throw new Error('Pega una URL pública de YouTube.');
     name='YouTube';
-    fingerprint=await fingerprintMeta({youtubeUrl:url});
+    fingerprint=await fingerprintMeta({youtubeUrl:url,guideFingerprint,mode:'single-interaction-v18.2'});
     const active=activeJobFor(fingerprint);
     if(active){
       onProgress('Reanudando el análisis cloud que ya estaba en curso…',.56);
@@ -199,7 +222,7 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
       return {jobId:active.jobId,name:active.name||name,fingerprint,transcript};
     }
     onProgress('Enviando referencia de YouTube a Gemini…',.12);
-    const interaction=await startInteraction({youtubeUrl:url,model});
+    const interaction=await startInteraction({youtubeUrl:url,model,guides});
     if(!interaction?.id)throw new Error('Gemini no devolvió el ID del trabajo de video.');
     saveActive(interaction.id,name,fingerprint);
     const transcript=await awaitJob(interaction.id,onProgress);
@@ -213,12 +236,12 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
     if(!String(meta.mimeType||'').startsWith('video/'))throw new Error('El archivo seleccionado de Drive no es un video.');
     name=meta.name||name;
     mimeType=meta.mimeType||mimeType;
-    fingerprint=await fingerprintMeta({id:meta.id,name:meta.name,size:meta.size,modifiedTime:meta.modifiedTime,md5Checksum:meta.md5Checksum});
+    fingerprint=await fingerprintMeta({id:meta.id,name:meta.name,size:meta.size,modifiedTime:meta.modifiedTime,md5Checksum:meta.md5Checksum,guideFingerprint,mode:'single-interaction-v18.2'});
   }else{
     if(!file)throw new Error('Selecciona un video.');
     name=file.name||name;
     mimeType=file.type||mimeType;
-    fingerprint=await fingerprintMeta({name:file.name,size:file.size,lastModified:file.lastModified,type:file.type});
+    fingerprint=await fingerprintMeta({name:file.name,size:file.size,lastModified:file.lastModified,type:file.type,guideFingerprint,mode:'single-interaction-v18.2'});
     meta={name,size:file.size,mimeType};
   }
 
@@ -238,8 +261,8 @@ export async function processVideo({file,driveReference,youtubeUrl,model,onProgr
   mimeType=f.mimeType||f.mime_type||mimeType;
   if(!uri)throw new Error('No se obtuvo la URI activa del video en Gemini.');
 
-  onProgress('Iniciando análisis agentic del video completo…',.56);
-  const interaction=await startInteraction({uri,mimeType,model});
+  onProgress('Iniciando una sola interacción: video + guía + borrador…',.56);
+  const interaction=await startInteraction({uri,mimeType,model,guides});
   if(!interaction?.id)throw new Error('Gemini no devolvió el ID del trabajo de video.');
   saveActive(interaction.id,name,fingerprint);
   const transcript=await awaitJob(interaction.id,onProgress);
